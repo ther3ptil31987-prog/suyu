@@ -6,7 +6,6 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from patch_generated_memory import patch, HELPER
 
 LINK_GC = '-Wl,-dead_strip' if sys.platform == 'darwin' else '-Wl,--gc-sections'
 ROOT = Path(__file__).resolve().parents[3]
@@ -65,6 +64,22 @@ int main(void) {
     before=loads; (void)ld[k](&c,16380); assert(loads==before+1);
     hm.address_space_max=16384;
   }
+  map_page(0,backing[0]); map_page(1,backing[2]);
+  for(unsigned shift=64;shift<=65;++shift) {
+    hm.page_bits=shift; unsigned before=loads;
+    assert(recomp_load32(&c,128)==read_cb(0,128,4)); assert(loads==before+2);
+  }
+  hm.page_bits=1; { unsigned before=loads; (void)recomp_load64(&c,0); assert(loads==before+1); }
+  hm.page_bits=12;
+  for(unsigned size=8;size<=16;size+=8) {
+    hm.address_space_max=129; unsigned before=loads; uint64_t lo,hi;
+    if(size==8) recomp_ldp32(&c,128,&lo,&hi); else recomp_ldp64(&c,128,&lo,&hi);
+    assert(loads==before+2);
+    before=stores;
+    if(size==8) recomp_stp32(&c,128,lo,hi); else recomp_stp64(&c,128,lo,hi);
+    assert(stores==before+2);
+  }
+  hm.address_space_max=16384;
   puts("PASS: emitted scalar memory spans, discontiguous pages, alias/remap/unmap, callbacks");
 }
 '''
@@ -81,25 +96,47 @@ class GeneratedMemory(unittest.TestCase):
         end=source.index('    /// Base address',start)
         callbacks=source[start:end]
         # Compile the exact production callback bodies, not a test reimplementation.
-        # The fake Memory offers only byte operations; old scalar callbacks cannot compile.
+        # Memory and logging are test doubles. The production callback bodies
+        # are compiled unchanged, including scalar dispatch and span validation.
         stub = r'''
-using u64=uint64_t; using u32=uint32_t; using u8=uint8_t;
+#include <algorithm>
+#include <string>
+using u64=uint64_t; using u32=uint32_t; using u16=uint16_t; using u8=uint8_t;
+// Formatting is diagnostic-only and cannot affect the memory result.
+namespace fmt { template<class... A> std::string format(const char*, A&&...) { return {}; } }
+#define LOG_ERROR(...) ((void)0)
+constexpr u64 kTrapStoreLo=0, kTrapStoreHi=0;
 struct TestMemory {
-    bool IsValidVirtualAddress(u64) const { return true; }
+    bool IsValidVirtualAddress(u64 a) const { return a < 16384 && pages[a>>12]; }
     u8 Read8(u64 a) { return (u8)read_cb(nullptr,a,1); }
+    u16 Read16(u64 a) { return (u16)read_cb(nullptr,a,2); }
+    u32 Read32(u64 a) { return (u32)read_cb(nullptr,a,4); }
+    u64 Read64(u64 a) { return read_cb(nullptr,a,8); }
     void Write8(u64 a,u8 v) { write_cb(nullptr,a,1,v); }
+    void Write16(u64 a,u16 v) { write_cb(nullptr,a,2,v); }
+    void Write32(u64 a,u32 v) { write_cb(nullptr,a,4,v); }
+    void Write64(u64 a,u64 v) { write_cb(nullptr,a,8,v); }
 };
 struct TestSystem { TestMemory memory; TestMemory& ApplicationMemory() { return memory; } };
 struct Impl { TestSystem system;
+    static constexpr size_t kTrail=32;
+    size_t trail_pos=0; u64 trail[kTrail]{};
+    struct { u64 pc=0; u64 x[32]{}; } ctx;
+    static void ReportUnmapped(Impl*,u64,u32,const char*) {}
 ''' + callbacks + '\n};\n'
         h=HARNESS.replace('#include "recomp_runtime.c"', 'extern "C" {\n#include "recomp_runtime.h"\n}')
         h=h.replace('int main(void) {',stub+'int main(void) {\n  Impl impl;')
         h=h.replace('hm.load=read_cb; hm.store=write_cb;', 'hm.user=&impl; hm.load=Impl::HostLoad; hm.store=Impl::HostStore;')
-        h=h.replace('assert(stores==before+1);','assert(stores==before+size);')
-        h=h.replace('assert(loads==before+1);','assert(loads==before+size);')
         h=h.replace('  puts("PASS:', r'''  unsigned before=loads; assert(Impl::HostLoad(&impl,UINT64_MAX,8)==0); assert(loads==before);
   before=stores; Impl::HostStore(&impl,UINT64_MAX,8,1); assert(stores==before);
-  assert(Impl::HostLoad(&impl,0,3)==0);
+  for(u32 width : {3U,5U,16U,UINT32_MAX}) {
+    before=loads; assert(Impl::HostLoad(&impl,0,width)==0); assert(loads==before);
+    before=stores; Impl::HostStore(&impl,0,width,1); assert(stores==before);
+  }
+  before=loads; assert(Impl::HostLoad(&impl,UINT64_MAX-1,0)==0); assert(loads==before);
+  map_page(0,backing[0]); memset(backing[0],0,4);
+  assert(Impl::HostLoad(&impl,0,0)==(1ULL<<32)); // A mapped zero word is valid.
+  map_page(0,0); assert(Impl::HostLoad(&impl,0,0)==0);
   puts("PASS:''')
         with tempfile.TemporaryDirectory(prefix='ihorizon-host-memory-') as tmp:
             out=Path(tmp)
@@ -121,11 +158,12 @@ struct Impl { TestSystem system;
             run([os.environ.get('CC','cc'),'-std=c11','-O1','-DSUYU_HOSTED_RECOMP=1','-DRECOMP_STATIC_HOST=1','-ffunction-sections','-fdata-sections',module/'memory_test.c',LINK_GC,'-lm','-o',out/'test'])
             self.assertIn('PASS:',run([out/'test']))
             source=(module/'recomp_runtime.c').read_text()
-            old=source.replace(HELPER,'')
-            for size in (2,4,8):
-                old=old.replace(f'recomp_scalar_same_page(c->host_mem,a,{size})?recomp_host_ptr(c,a):0','recomp_host_ptr(c,a)')
-            self.assertEqual(patch(old),source)
-            with self.assertRaises(ValueError): patch(source)
+            # Mutate only the actual current helper: accepting all spans must
+            # fail the discontiguous-page/bounds assertions above.
+            start=source.index('static unsigned char* recomp_host_ptr_n(GuestContext* c, uint64_t va, uint64_t bytes){')
+            end=source.index('\n}',start)+2
+            old=source[:start]+('static unsigned char* recomp_host_ptr_n(GuestContext* c, uint64_t va, uint64_t bytes){'
+                 '(void)bytes; return recomp_host_ptr(c,va);}')+source[end:]
             # Prove the regression is detected against the pre-fix emitted runtime.
             (module/'recomp_runtime.c').write_text(old)
             run([os.environ.get('CC','cc'),'-std=c11','-O1','-DSUYU_HOSTED_RECOMP=1','-DRECOMP_STATIC_HOST=1','-ffunction-sections','-fdata-sections',module/'memory_test.c',LINK_GC,'-lm','-o',out/'old-test'])

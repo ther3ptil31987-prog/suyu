@@ -17,20 +17,37 @@ static constexpr size_t BACKING_SIZE = 4_GiB;
 static constexpr auto PERMS = Common::MemoryPermission::ReadWrite;
 static constexpr auto HEAP = false;
 
+static void RequireFastmemArena(HostMemory& mem) {
+    REQUIRE(mem.BackingBasePointer() != nullptr);
+    if (mem.VirtualBasePointer() == nullptr) {
+        SKIP("Fastmem arena unavailable; software page-table backing is tested separately");
+    }
+}
+
 TEST_CASE("HostMemory: Initialize and deinitialize", "[common]") {
     {
         HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
         REQUIRE(mem.BackingBasePointer() != nullptr);
+        volatile u8* const backing = mem.BackingBasePointer();
+        backing[0] = 17;
+        backing[BACKING_SIZE - 1] = 29;
+        REQUIRE(backing[0] == 17);
+        REQUIRE(backing[BACKING_SIZE - 1] == 29);
     }
     {
         HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
         REQUIRE(mem.BackingBasePointer() != nullptr);
+        volatile u8* const backing = mem.BackingBasePointer();
+        backing[0] = 17;
+        backing[BACKING_SIZE - 1] = 29;
+        REQUIRE(backing[0] == 17);
+        REQUIRE(backing[BACKING_SIZE - 1] == 29);
     }
 }
 
 TEST_CASE("HostMemory: Simple map", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x5000, 0x8000, 0x1000, PERMS, HEAP);
 
     volatile u8* const data = mem.VirtualBasePointer() + 0x5000;
@@ -40,7 +57,7 @@ TEST_CASE("HostMemory: Simple map", "[common]") {
 
 TEST_CASE("HostMemory: Simple mirror map", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x5000, 0x3000, 0x2000, PERMS, HEAP);
     mem.Map(0x8000, 0x4000, 0x1000, PERMS, HEAP);
 
@@ -52,7 +69,7 @@ TEST_CASE("HostMemory: Simple mirror map", "[common]") {
 
 TEST_CASE("HostMemory: Simple unmap", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x5000, 0x3000, 0x2000, PERMS, HEAP);
 
     volatile u8* const data = mem.VirtualBasePointer() + 0x5000;
@@ -64,7 +81,7 @@ TEST_CASE("HostMemory: Simple unmap", "[common]") {
 
 TEST_CASE("HostMemory: Simple unmap and remap", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x5000, 0x3000, 0x2000, PERMS, HEAP);
 
     volatile u8* const data = mem.VirtualBasePointer() + 0x5000;
@@ -82,7 +99,7 @@ TEST_CASE("HostMemory: Simple unmap and remap", "[common]") {
 
 TEST_CASE("HostMemory: Nieche allocation", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x0000, 0, 0x20000, PERMS, HEAP);
     mem.Unmap(0x0000, 0x4000, HEAP);
     mem.Map(0x1000, 0, 0x2000, PERMS, HEAP);
@@ -92,7 +109,7 @@ TEST_CASE("HostMemory: Nieche allocation", "[common]") {
 
 TEST_CASE("HostMemory: Full unmap", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x8000, 0, 0x4000, PERMS, HEAP);
     mem.Unmap(0x8000, 0x4000, HEAP);
     mem.Map(0x6000, 0, 0x16000, PERMS, HEAP);
@@ -100,7 +117,7 @@ TEST_CASE("HostMemory: Full unmap", "[common]") {
 
 TEST_CASE("HostMemory: Right out of bounds unmap", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x0000, 0, 0x4000, PERMS, HEAP);
     mem.Unmap(0x2000, 0x4000, HEAP);
     mem.Map(0x2000, 0x80000, 0x4000, PERMS, HEAP);
@@ -108,6 +125,7 @@ TEST_CASE("HostMemory: Right out of bounds unmap", "[common]") {
 
 TEST_CASE("HostMemory: Left out of bounds unmap", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    RequireFastmemArena(mem);
 
     mem.Map(0x8000, 0, 0x4000, PERMS, HEAP);
     mem.Unmap(0x6000, 0x4000, HEAP);
@@ -116,7 +134,7 @@ TEST_CASE("HostMemory: Left out of bounds unmap", "[common]") {
 
 TEST_CASE("HostMemory: Multiple placeholder unmap", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x0000, 0, 0x4000, PERMS, HEAP);
     mem.Map(0x4000, 0, 0x1b000, PERMS, HEAP);
     mem.Unmap(0x3000, 0x1c000, HEAP);
@@ -125,7 +143,7 @@ TEST_CASE("HostMemory: Multiple placeholder unmap", "[common]") {
 
 TEST_CASE("HostMemory: Unmap between placeholders", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x0000, 0, 0x4000, PERMS, HEAP);
     mem.Map(0x4000, 0, 0x4000, PERMS, HEAP);
     mem.Unmap(0x2000, 0x4000, HEAP);
@@ -134,7 +152,7 @@ TEST_CASE("HostMemory: Unmap between placeholders", "[common]") {
 
 TEST_CASE("HostMemory: Unmap to origin", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x4000, 0, 0x4000, PERMS, HEAP);
     mem.Map(0x8000, 0, 0x4000, PERMS, HEAP);
     mem.Unmap(0x4000, 0x4000, HEAP);
@@ -144,7 +162,7 @@ TEST_CASE("HostMemory: Unmap to origin", "[common]") {
 
 TEST_CASE("HostMemory: Unmap to right", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x4000, 0, 0x4000, PERMS, HEAP);
     mem.Map(0x8000, 0, 0x4000, PERMS, HEAP);
     mem.Unmap(0x8000, 0x4000, HEAP);
@@ -153,7 +171,7 @@ TEST_CASE("HostMemory: Unmap to right", "[common]") {
 
 TEST_CASE("HostMemory: Partial right unmap check bindings", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x4000, 0x10000, 0x4000, PERMS, HEAP);
 
     volatile u8* const ptr = mem.VirtualBasePointer() + 0x4000;
@@ -166,7 +184,7 @@ TEST_CASE("HostMemory: Partial right unmap check bindings", "[common]") {
 
 TEST_CASE("HostMemory: Partial left unmap check bindings", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x4000, 0x10000, 0x4000, PERMS, HEAP);
 
     volatile u8* const ptr = mem.VirtualBasePointer() + 0x4000;
@@ -181,7 +199,7 @@ TEST_CASE("HostMemory: Partial left unmap check bindings", "[common]") {
 
 TEST_CASE("HostMemory: Partial middle unmap check bindings", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x4000, 0x10000, 0x4000, PERMS, HEAP);
 
     volatile u8* const ptr = mem.VirtualBasePointer() + 0x4000;
@@ -196,7 +214,7 @@ TEST_CASE("HostMemory: Partial middle unmap check bindings", "[common]") {
 
 TEST_CASE("HostMemory: Partial sparse middle unmap and check bindings", "[common]") {
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
-    REQUIRE(mem.BackingBasePointer() != nullptr);
+    RequireFastmemArena(mem);
     mem.Map(0x4000, 0x10000, 0x2000, PERMS, HEAP);
     mem.Map(0x6000, 0x20000, 0x2000, PERMS, HEAP);
 

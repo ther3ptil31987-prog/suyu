@@ -9,6 +9,14 @@ add_library(core STATIC
     arm/arm_interface.h
     arm/recomp/arm_recomp.cpp
     arm/recomp/arm_recomp.h
+    arm/recomp/recomp_gap_session.cpp
+    arm/recomp/recomp_gap_session.h
+    arm/recomp/recomp_gaps.cpp
+    arm/recomp/recomp_gaps.h
+    arm/recomp/recomp_guard_gen.cpp
+    arm/recomp/recomp_guard_gen.h
+    arm/recomp/guest_fp_env.h
+    arm/recomp/recomp_image_features.h
     arm/debug.cpp
     arm/debug.h
     arm/exclusive_monitor.cpp
@@ -35,10 +43,14 @@ add_library(core STATIC
     crypto/ctr_encryption_layer.h
     crypto/encryption_layer.cpp
     crypto/encryption_layer.h
+    crypto/hmac_sha256.cpp
+    crypto/hmac_sha256.h
     crypto/key_manager.cpp
     crypto/key_manager.h
     crypto/partition_data_manager.cpp
     crypto/partition_data_manager.h
+    crypto/portable_seal.cpp
+    crypto/portable_seal.h
     crypto/xts_encryption_layer.cpp
     crypto/xts_encryption_layer.h
     debugger/debugger.cpp

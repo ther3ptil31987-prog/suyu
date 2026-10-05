@@ -65,6 +65,19 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     });
 }
 
+void ThreadManager::ShutdownThread() {
+    if (!thread.joinable()) {
+        return;
+    }
+    {
+        // Under write_lock so no producer can pass the stop check in PushCommand and then
+        // block in EmplaceWait on a queue whose consumer has already exited.
+        std::scoped_lock lk{state.write_lock};
+        thread.request_stop();
+    }
+    thread.join();
+}
+
 void ThreadManager::SubmitList(s32 channel, Tegra::CommandList&& entries, bool is_async) {
     PushCommand(SubmitListCommand(channel, std::move(entries)), false, is_async);
 }
@@ -105,6 +118,10 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     }
 
     std::unique_lock lk(state.write_lock);
+    if (thread.get_stop_token().stop_requested()) {
+        // No consumer is left; queueing would only fill the queue and block the caller.
+        return state.last_fence;
+    }
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
 

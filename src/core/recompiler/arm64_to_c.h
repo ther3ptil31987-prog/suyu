@@ -302,6 +302,45 @@ inline std::string ChainTo(u64 t);
 // instruction, so the forms that lose to the JIT are turned on here.
 inline bool g_translate_all = false;
 
+// The per-module standalone runner: main.c plus the module's text, rodata and
+// data segments bundled beside it, so the translated code can run on its own
+// with no emulator, no game file and no keys. The recompiler's own tests use it
+// with synthetic code. The game exporter turns it off: a game's translated code
+// may only run inside suyu, loaded against the user's own game file and keys.
+inline bool g_emit_standalone_runner = true;
+
+// ABI 6 "FM1": memory helpers that read the host page table directly and fall
+// back to the unchanged ABI 5 helpers for anything else. Off by default; while
+// it is off the emitted text is byte-identical to ABI 5, which
+// tests/recompiler_smoke checks against a golden hash.
+inline bool g_emit_fastmem = false;
+
+// ABI 6 feature GG1: blocks re-run the code guard only when their module's
+// generation word has moved since they last passed it, instead of on every
+// entry. An extension of ABI 6, so it takes effect only together with
+// g_emit_fastmem. Off by default; while it is off the ABI 5 and ABI 6 texts are
+// byte-identical to what they were before it existed (golden hashes in
+// tests/recompiler_smoke).
+inline bool g_emit_guard_gen = false;
+inline bool EmitGuardGen() {
+    return g_emit_fastmem && g_emit_guard_gen;
+}
+
+// ABI 6 "FPX1": exact native floating point. Each FP op the option covers gets a
+// native fast path whose result is kept only when it provably equals the
+// architectural result and adds no FPSR bit the guest has not already set;
+// anything else runs the unchanged exact body. Off by default, and while it is
+// off the emitted text is byte-identical to what it would be without it.
+inline bool g_emit_fpx = false;
+// Instrumentation only, never timed: with g_emit_fpx, the exact body runs
+// after every fast path too, and recomp_fpx_shadow compares the two.
+inline bool g_emit_fpx_shadow = false;
+
+// Strict static exports have no fallback to carry deliberately gated forms.
+inline bool TranslateAllForExport(bool strict_static, bool explicitly_requested) {
+    return strict_static || explicitly_requested;
+}
+
 inline const std::unordered_set<u64>* g_chain_blocks = nullptr;
 inline const char* g_chain_mod = nullptr;
 
@@ -430,52 +469,44 @@ inline std::string Xsp(u32 r) {
 // Emit one baseline S/D addition/subtraction from raw uint64_t _a/_b to _v.
 // Three guard bits plus sticky alignment preserve exact rounding, including
 // cancellation. No host FP arithmetic or host FP state is involved.
-/// Emit a native host-FP fast path in front of a soft-float value body.
-///
-/// The guest is AArch64 and, on iOS, so is the host. With FPCR in its default
-/// configuration the host FPU is bit-identical to the guest for these
-/// operations: same IEEE-754 rounding, same signed zeros, and - because both
-/// are ARM - the same NaN propagation order. The soft-float body spends
-/// hundreds of integer operations per lane on work one FMLA does natively,
-/// which the device profile showed to be the single largest cost in the frame.
-///
-/// The fast path is refused whenever the guest has selected a non-default
-/// rounding mode, flush-to-zero, default-NaN, alternative half precision, or
-/// enabled any exception trap - every FPCR bit that would make the host
-/// disagree. In those cases the soft-float body runs exactly as before.
-///
-/// It is restricted to AArch64 hosts on purpose. On x86-64 the NaN chosen by a
-/// multiply-add differs from ARM's order, so a native path there would change
-/// results relative to the desktop reference export. Keeping it ARM-only means
-/// the exported module stays bit-identical on the machine it was verified on.
-///
-/// Known limitation: FPSR exception flags are not raised on this path. They are
-/// sticky status bits, so a guest that reads FPSR after arithmetic that only
-/// took the fast path sees them clear. Define RECOMP_NO_NATIVE_FP to compile
-/// the generated module with the soft-float path only, which restores flag
-/// behaviour exactly.
-///
-/// `op` is one of "add", "sub", "div" or "fma"; "fma" reads the addend from _z.
+// The integer value emitter is the reference on every host. With FPX1 each
+// covered op first tries recomp_fpx_<op> (recomp_runtime.h), which computes
+// natively and answers 0 unless the result is provably exact (see the FPX1
+// block of the runtime header); the exact body is the fallback. The prefix
+// opens a do{ ... }while(0) whose break skips the exact body, and
+// EmitFPNativeSuffix closes it. `op` names the helper: add, sub, mul, div,
+// fma, recps, rsqrts (raw inputs _aa/_bb) or sqrt (input _a).
+inline std::string FpxArgs(const char* op) {
+    if (!std::strcmp(op, "fma")) return "_a,_b,_z";
+    if (!std::strcmp(op, "recps") || !std::strcmp(op, "rsqrts")) return "_aa,_bb";
+    if (!std::strcmp(op, "sqrt")) return "_a";
+    return "_a,_b";
+}
 inline std::string EmitFPNativeValue(bool dbl, const char* op) {
-    const std::string ft = dbl ? "double" : "float";
-    const std::string it = dbl ? "uint64_t" : "uint32_t";
-    const std::string fma = dbl ? "__builtin_fma" : "__builtin_fmaf";
-    const std::string sz = dbl ? "8" : "4";
-    std::string expr;
-    if (!std::strcmp(op, "add")) expr = "_na+_nb";
-    else if (!std::strcmp(op, "sub")) expr = "_na-_nb";
-    else if (!std::strcmp(op, "div")) expr = "_na/_nb";
-    else expr = fma + "(_na,_nb,_nz)";
-    std::string s =
-        "\n#if defined(__aarch64__) && !defined(RECOMP_NO_NATIVE_FP)\n"
-        "if(!(c->fpcr&0x07C8FF07ULL)){" + ft + " _na,_nb,_nr;" + it + " _nt;"
-        "_nt=(" + it + ")_a;memcpy(&_na,&_nt," + sz + ");"
-        "_nt=(" + it + ")_b;memcpy(&_nb,&_nt," + sz + ");";
-    if (!std::strcmp(op, "fma"))
-        s += ft + " _nz;_nt=(" + it + ")_z;memcpy(&_nz,&_nt," + sz + ");";
-    s += "_nr=" + expr + ";memcpy(&_nt,&_nr," + sz + ");_v=(uint64_t)_nt;} else\n"
-         "#endif\n";
-    return s;
+    if (!g_emit_fpx) return {};
+    const std::string call = std::string("recomp_fpx_") + op + (dbl ? "64(" : "32(") + FpxArgs(op);
+    if (g_emit_fpx_shadow) {
+        return "do{uint64_t _fxv=0,_fxs=c->fpsr;int _fxg=RECOMP_FPX_OPEN(c),_fxk=_fxg&&" + call +
+               ",&_fxv);";
+    }
+    return "do{if(RECOMP_FPX_OPEN(c)&&RECOMP_LIKELY(" + call +
+           ",&_v))){RECOMP_FPX_PROBE(1);break;}RECOMP_FPX_PROBE(2);";
+}
+inline std::string EmitFPNativeSuffix(bool dbl, const char* op) {
+    if (!g_emit_fpx) return {};
+    if (g_emit_fpx_shadow) {
+        static const char* const kinds[] = {"add", "sub", "mul", "div", "fma", "recps", "rsqrts", "sqrt"};
+        unsigned kind = 0;
+        while (kind < 8 && std::strcmp(kinds[kind], op)) ++kind;
+        const std::string args = FpxArgs(op);
+        const std::string first = args.substr(0, args.find(','));
+        const std::string second = args.find(',') == std::string::npos
+            ? std::string("0") : args.substr(args.find(',') + 1, args.find(',', args.find(',') + 1) -
+                                                                   args.find(',') - 1);
+        return "recomp_fpx_shadow(" + std::to_string(kind * 2 + (dbl ? 1 : 0)) +
+               "u,_fxg,_fxk,_fxv,_v,_fxs,c->fpsr," + first + "," + second + ");}while(0);";
+    }
+    return "}while(0);";
 }
 
 inline std::string EmitFPAddSubValue(bool dbl, bool subtract) {
@@ -514,7 +545,7 @@ inline std::string EmitFPAddSubValue(bool dbl, bool subtract) {
         "if(_rounded>=(_hidden<<1)){_rounded>>=1;++_ea;}"
         "if(_ea>=(unsigned)(_exp>>_f)){c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_sa)||(_mode==2&&_sa))?_exp:_exp-1;}"
         "else _v=((_rounded>=_hidden?(uint64_t)_ea:0)<<_f)|(_rounded&_frac);}"
-        "if(_sa)_v|=_sign;}}}";
+        "if(_sa)_v|=_sign;}}}" + EmitFPNativeSuffix(dbl, subtract ? "sub" : "add");
 }
 
 // Generated exact product/addend lattice. Inputs _a,_b,_z and output _v are
@@ -560,7 +591,7 @@ else {
  }
 }
 }
-)C";
+)C" + EmitFPNativeSuffix(dbl, "div");
 }
 
 // Architectural reciprocal estimate. The estimate is deliberately computed
@@ -631,8 +662,10 @@ else {
     return s;
 }
 
-inline std::string EmitFPMulAddValue(bool dbl) {
-    std::string s=EmitFPNativeValue(dbl, "fma")+
+// `mul` marks a multiply (FMUL/FNMUL), whose addend is the sign-matched zero
+// the caller supplies: the fast path then needs no fused multiply-add.
+inline std::string EmitFPMulAddValue(bool dbl, bool mul = false) {
+    std::string s=EmitFPNativeValue(dbl, mul ? "mul" : "fma")+
         "{ const unsigned _f="+std::string(dbl?"52":"23")+
         ",_bias="+(dbl?"1023":"127")+",_count="+(dbl?"67":"9")+
         "; const int _base="+(dbl?"-2148":"-298")+"; uint64_t _p["+
@@ -697,7 +730,152 @@ else {
 }
 }
 )C";
+    s += EmitFPNativeSuffix(dbl, mul ? "mul" : "fma");
     return s;
+}
+
+// FRECPS/FRSQRTS S/D, evaluated exactly before one rounding: 2 - a*b, or
+// (3 - a*b)/2 for FRSQRTS (`half`). Inputs are the raw operand bits _aa and
+// _bb; the result bits are left in _v, which this text declares. A fixed
+// multiword product lattice covers every finite input exponent. This
+// deliberately favors correctness over speed; no host fma or intermediate
+// halve can introduce double rounding. Baseline FP modes only: exception/
+// access trap delivery and FEAT_AFP remain unsupported. The line breaks match
+// what put() emits, so the scalar text is unchanged by sharing it.
+inline std::string EmitFPStepValue(bool dbl, bool half) {
+    std::string s = std::string("const unsigned _f=")+(dbl?"52":"23")+",_bias="+(dbl?"1023":"127")+
+            ",_count="+(dbl?"67":"9")+";const int _base="+
+            std::to_string((dbl?-2148:-298)-(half?1:0))+";"
+            "const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1,_exp="+
+            (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_sign="+
+            (dbl?"0x8000000000000000ULL":"0x80000000ULL")+";"
+            // FPNeg precedes NaN processing in the architectural pseudocode.
+            "uint64_t _a=(uint64_t)_aa^_sign,_b=_bb,_v=0;"+EmitFPNativeValue(dbl,half?"rsqrts":"recps")+
+            "unsigned _mode=(unsigned)(c->fpcr>>22)&3;"
+            "if(c->fpcr&(1ULL<<24)) {if(!(_a&_exp)&&(_a&_frac)) {_a&=_sign;c->fpsr|=128;}"
+            "if(!(_b&_exp)&&(_b&_frac)) {_b&=_sign;c->fpsr|=128;}}"
+            "int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
+            "if(_an||_bn) {int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
+            "_v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;if(_as||_bs) {c->fpsr|=1;}"
+            "if(c->fpcr&(1ULL<<25)) {_v=_exp|_quiet;}}"
+            "else if(((_a&_exp)==_exp&&!(_b&~_sign))||((_b&_exp)==_exp&&!(_a&~_sign)))"
+            "_v="+(dbl?(half?"0x3ff8000000000000ULL":"0x4000000000000000ULL"):
+                         (half?"0x3fc00000ULL":"0x40000000ULL"))+";"
+            "else if((_a&_exp)==_exp||(_b&_exp)==_exp)_v=_exp|((_a^_b)&_sign);"
+            "else {unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f);"
+            "uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0);"
+            "uint64_t _p["+std::string(dbl?"67":"9")+"]={0},_c["+(dbl?"67":"9")+"]={0};"
+            "uint64_t _a0=(uint32_t)_ma,_a1=_ma>>32,_b0=(uint32_t)_mb,_b1=_mb>>32;"
+            "uint64_t _lo=_a0*_b0,_x=_a0*_b1,_y=_a1*_b0,_hi=_a1*_b1+(_x>>32)+(_y>>32);"
+            "uint64_t _old=_lo;_lo+=_x<<32;_hi+=_lo<_old;_old=_lo;_lo+=_y<<32;_hi+=_lo<_old;"
+            "unsigned _shift=(_ea?_ea-1:0)+(_eb?_eb-1:0),_j=_shift/64,_s=_shift%64;"
+            "_p[_j]=_lo<<_s;_p[_j+1]=(_hi<<_s)|(_s?_lo>>(64-_s):0);"
+            "if(_s&&_j+2<_count)_p[_j+2]=_hi>>(64-_s);"
+            "unsigned _bit="+std::string(dbl?"2149":"299")+";_c[_bit/64]|=1ULL<<(_bit%64);\n    ";
+    if(half)s+="--_bit;_c[_bit/64]|=1ULL<<(_bit%64);\n    ";
+    s+="unsigned _negative=0;"
+            "if((_a^_b)&_sign) {int _compare=0;for(int _k=(int)_count-1;_k>=0;--_k)"
+            "{if(_p[_k]!=_c[_k]) {_compare=_p[_k]>_c[_k]?1:-1;break;}}"
+            "_negative=_compare>0;uint64_t _borrow=0;for(unsigned _k=0;_k<_count;++_k)"
+            "{uint64_t _left=_negative?_p[_k]:_c[_k],_right=_negative?_c[_k]:_p[_k];"
+            "uint64_t _diff=_left-_right,_next=(_left<_right)||(_diff<_borrow);"
+            "_p[_k]=_diff-_borrow;_borrow=_next;}}"
+            "else {uint64_t _carry=0;for(unsigned _k=0;_k<_count;++_k)"
+            "{uint64_t _sum=_p[_k]+_c[_k],_next=_sum<_p[_k];"
+            "uint64_t _total=_sum+_carry;_carry=_next||_total<_sum;_p[_k]=_total;}}"
+            "int _top=recomp_fp_top_bit(_p,_count);"
+            "if(_top<0)_v=_mode==2?_sign:0;else {int _e=_top+_base,_emin=1-(int)_bias;"
+            "if(_e<_emin&&(c->fpcr&(1ULL<<24))) {c->fpsr|=8;_v=_negative?_sign:0;}"
+            "else {int _cut=_top-(int)_f,_mincut=_emin-(int)_f-_base;if(_cut<_mincut)_cut=_mincut;"
+            "unsigned _index=(unsigned)_cut/64,_offset=(unsigned)_cut%64;"
+            "uint64_t _mant=_p[_index]>>_offset;if(_offset&&_index+1<_count)_mant|=_p[_index+1]<<(64-_offset);"
+            "unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1);"
+            "unsigned _sticky=recomp_fp_sticky(_p,_count,_cut);"
+            "unsigned _lost=_roundbit|_sticky;if(_lost) {c->fpsr|=16;if(_e<_emin)c->fpsr|=8;"
+            "if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}"
+            "if(_e<_emin)_e=_emin;if(_mant>=(_hidden<<1)) {_mant>>=1;++_e;}"
+            "if(_e>(int)_bias) {c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}"
+            "else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);"
+            "if(_negative)_v|=_sign;}}}"+EmitFPNativeSuffix(dbl,half?"rsqrts":"recps");
+    return s;
+}
+
+// Arm FPMin/FPMax/FPMinNum/FPMaxNum on raw S/D bits `a` and `b`, with bitwise
+// ordering so host NaN, signed-zero and denormal modes cannot intervene.
+// Implements baseline FPCR.DN/FZ and cumulative FPSR.IOC/IDC; `store` consumes
+// the result in _v. The line breaks match what put() emits.
+inline std::string EmitFPMinMax(bool dbl, bool minimum, bool numeric, const std::string& a,
+                                const std::string& b, const std::string& store) {
+    std::string s = "{ uint64_t _a=" + a + ",_b=" + b + ",_v; const uint64_t _sign=" +
+        (dbl ? std::string("0x8000000000000000ULL") : "0x80000000ULL") +
+        ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
+        ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
+        ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";\n    ";
+    s += "if(c->fpcr & (1ULL<<24)) {"
+        " if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
+        " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }\n    ";
+    s += "{ int _an=(_a&_exp)==_exp&&(_a&_frac),"
+        " _bn=(_b&_exp)==_exp&&(_b&_frac);"
+        " int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
+        " if(_as||_bs) { c->fpsr|=1; _v=(_as?_a:_b)|_quiet; }\n    ";
+    if (numeric) {
+        s += "else if(_an&&!_bn) _v=_b; else if(_bn&&!_an) _v=_a;\n    ";
+    }
+    s += "else if(_an||_bn) _v=(_an?_a:_b)|_quiet;"
+        " else if(!((_a|_b)&~_sign)) _v=" +
+        std::string(minimum ? "(_a|_b)" : "(_a&_b)") + ";"
+        " else { int _less=((_a^_b)&_sign)?!!(_a&_sign):"
+        " ((_a&_sign)?_a>_b:_a<_b); _v=" +
+        std::string(minimum ? "(_less?_a:_b)" : "(_less?_b:_a)") + "; }\n    ";
+    s += "if((c->fpcr&(1ULL<<25))&&((_v&_exp)==_exp)&&(_v&_frac))"
+        " { _v=_exp|_quiet; } " + store + " } }";
+    return s;
+}
+
+// FCMP-style comparison of S/D registers `a` and `b` (register arrays; an
+// empty `b` compares with +0.0) into NZCV: 0110 equal, 1000 less, 0010
+// greater, 0011 unordered. Integer ordering of the IEEE bits, so host compare
+// semantics and modes cannot intervene. FZ flushes subnormal inputs (IDC); a
+// NaN raises IOC when it is signalling, or for any NaN when `signal` is set.
+inline std::string EmitFPCompareFlags(bool dbl, bool signal, const std::string& a,
+                                      const std::string& b) {
+    const std::string sz = dbl ? "8" : "4";
+    return "{ uint64_t _a=0,_b=0; memcpy(&_a," + a + "," + sz + ");" +
+        (b.empty() ? std::string() : " memcpy(&_b," + b + "," + sz + ");") +
+        " const uint64_t _sign=" + (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
+        ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
+        ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
+        ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";"
+        " if(c->fpcr&(1ULL<<24)) { if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
+        " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }"
+        " int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
+        " if(_an||_bn) { if(" + (signal ? "1" : "(_an&&!(_a&_quiet))||(_bn&&!(_b&_quiet))") +
+        ") c->fpsr|=1; c->n=0; c->z=0; c->c=1; c->v=1; }"
+        " else { int _eq=_a==_b||!((_a|_b)&~_sign);"
+        " int _lt=!_eq&&(((_a^_b)&_sign)?!!(_a&_sign):((_a&_sign)?_a>_b:_a<_b));"
+        " c->n=(uint8_t)_lt; c->z=(uint8_t)_eq; c->c=(uint8_t)!_lt; c->v=0; } }";
+}
+
+// FCMEQ/FCMGE/FCMGT (`kind` "eq", "ge", "gt") of raw S/D bits `a` and `b` into
+// an all-ones or zero _v, which `store` consumes. Integer ordering of the IEEE
+// bits; FZ flushes subnormal inputs (IDC). A NaN compares false and raises IOC
+// when it is signalling, or for any NaN in the ordered GE/GT forms.
+inline std::string EmitFPCompareMask(bool dbl, const std::string& kind, const std::string& a,
+                                     const std::string& b, const std::string& store) {
+    const bool eq = kind == "eq";
+    return "{ uint64_t _a=" + a + ",_b=" + b + ",_v=0; const uint64_t _sign=" +
+        (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
+        ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
+        ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
+        ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";"
+        " if(c->fpcr&(1ULL<<24)) { if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
+        " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }"
+        " int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
+        " if(_an||_bn) { if(" + std::string(eq ? "(_an&&!(_a&_quiet))||(_bn&&!(_b&_quiet))" : "1") +
+        ") c->fpsr|=1; }"
+        " else { int _eq=_a==_b||!((_a|_b)&~_sign);"
+        " int _gt=!_eq&&(((_a^_b)&_sign)?!(_a&_sign):((_a&_sign)?_a<_b:_a>_b)); (void)_gt; (void)_eq;"
+        " if(" + (eq ? "_eq" : kind == "ge" ? "_eq||_gt" : "_gt") + ") _v=~(uint64_t)0; } " + store + " }";
 }
 
 inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr) {
@@ -2089,31 +2267,24 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     }
 
     // FRECPS: the Newton-Raphson step for reciprocal estimation, 2 - n*m.
-    // Bit 23 selects FRSQRTS, whose step is (3 - n*m)/2.
+    // Bit 23 selects FRSQRTS, whose step is (3 - n*m)/2. Both are fused: one
+    // rounding of the exact value, per lane through the scalar forms' exact
+    // body. Host arithmetic would round the product first unless the compiler
+    // happened to contract it, and gives NaN for inf*0 where the step is 2 or
+    // 1.5; it also never raised FPSR flags.
     if ((i & 0xBF20FC00) == 0x0E20FC00) {
         const u32 Q = (i >> 30) & 1;
         const bool rsqrt = ((i >> 23) & 1) != 0;
         const bool dbl = ((i >> 22) & 1) != 0;
         const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
-        const char* ct = dbl ? "double" : "float";
-        const int fsz = dbl ? 8 : 4;
-        const int bytes = Q ? 16 : 8;
-        const int lanes = bytes / fsz;
         if (!(dbl && !Q)) {
-            std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) + "],_b[" +
-                            std::to_string(lanes) + "],_r[" + std::to_string(lanes) + "]; ";
-            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
-            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
-            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=";
-            if (rsqrt) {
-                s += "((" + std::string(ct) + ")3.0-_a[_i]*_b[_i])*(" + std::string(ct) + ")0.5; ";
-            } else {
-                s += "(" + std::string(ct) + ")2.0-_a[_i]*_b[_i]; ";
-            }
-            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                 "][1]=0; ";
-            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
-            put(s);
+            const std::string ct = dbl ? "uint64_t" : "uint32_t", count = dbl ? "2" : "4";
+            const unsigned lanes = (Q ? 16 : 8) / (dbl ? 8 : 4);
+            put("{ " + ct + " _n[" + count + "],_m[" + count + "],_r[" + count +
+                "]={0};memcpy(_n,c->vreg[" + std::to_string(rn) + "],16);memcpy(_m,c->vreg[" +
+                std::to_string(rm) + "],16);for(unsigned _l=0;_l<" + std::to_string(lanes) +
+                ";++_l){uint64_t _aa=_n[_l],_bb=_m[_l];" + EmitFPStepValue(dbl, rsqrt) + "_r[_l]=(" +
+                ct + ")_v;}memcpy(c->vreg[" + std::to_string(rd) + "],_r,16);}");
             return true;
         }
     }
@@ -2647,29 +2818,17 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         const u32 rm = (i >> 16) & 31, rn = (i >> 5) & 31, rd = i & 31;
         const bool dbl = (size & 1) != 0;
         const char* cmp = nullptr;
-        if (!U && !(size & 2))      cmp = "==";   // FCMEQ
-        else if (U && !(size & 2))  cmp = ">=";   // FCMGE
-        else if (U && (size & 2))   cmp = ">";    // FCMGT
+        if (!U && !(size & 2))      cmp = "eq";   // FCMEQ
+        else if (U && !(size & 2))  cmp = "ge";   // FCMGE
+        else if (U && (size & 2))   cmp = "gt";   // FCMGT
         if (cmp && !(dbl && !Q)) {
-            const char* ct = dbl ? "double" : "float";
-            const int fsz = dbl ? 8 : 4;
-            const int bytes = Q ? 16 : 8;
-            const int lanes = bytes / fsz;
-            const std::string uty = "uint" + std::to_string(fsz * 8) + "_t";
-            std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) +
-                            "],_b[" + std::to_string(lanes) + "]; " + uty + " _r[" +
-                            std::to_string(lanes) + "]; ";
-            s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
-            s += "memcpy(_b,c->vreg[" + std::to_string(rm) + "]," + std::to_string(bytes) + "); ";
-            // A NaN operand compares false and the lane comes out zero, which is
-            // what the architecture specifies and what C's comparison already
-            // does - so no NaN test is needed here.
-            s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(_a[_i]" + cmp +
-                 "_b[_i]) ? (" + uty + ")~(" + uty + ")0 : (" + uty + ")0; ";
-            s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                 "][1]=0; ";
-            s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
-            put(s);
+            const std::string uty = dbl ? "uint64_t" : "uint32_t", count = dbl ? "2" : "4";
+            const int lanes = (Q ? 16 : 8) / (dbl ? 8 : 4);
+            put("{ " + uty + " _n[" + count + "],_m[" + count + "],_r[" + count +
+                "]={0}; memcpy(_n,c->vreg[" + std::to_string(rn) + "],16); memcpy(_m,c->vreg[" +
+                std::to_string(rm) + "],16); for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) " +
+                EmitFPCompareMask(dbl, cmp, "_n[_i]", "_m[_i]", "_r[_i]=(" + uty + ")_v;") +
+                " memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
             return true;
         }
     }
@@ -2851,75 +3010,40 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         return true;
     }
 
-    // FP <-> fixed-point conversions: the same shape as the integer forms
-    // below but with bit 21 clear and a scale field. fbits is 64 - scale, and
-    // the value is shifted by 2^fbits around the conversion. ldexp does that
-    // exactly; multiplying by a built-up power of two does not.
-    // Off deliberately, and measured: enabling this costs 25.0s against 20.7s on
-    // the reference replay. Translating one instruction pulls its whole block out
-    // of the JIT and into generated C, and these sit in float-heavy blocks the JIT
-    // compiles well - a NaN test, two bound compares and a cast cannot beat the
-    // single native instruction it replaces. Coverage only pays when the emitted C
-    // is faster than the JIT for that block. Re-measure before flipping this.
-    const bool kTranslateFixedPointConversions = g_translate_all;
-    if (kTranslateFixedPointConversions &&
-        (i & 0x5F200000) == 0x1E000000 && ((i >> 21) & 1) == 0) {
+    // Scalar FP <-> fixed-point conversions (S/D, W/X). A strict-static
+    // export cannot leave these to a JIT. Do not gate architectural coverage
+    // on the former hybrid replay-performance switch.
+    // Use integer significands, not host FP scaling/casts: preserve guest FZ,
+    // rounding and cumulative status without intermediate overflow/rounding.
+    if ((i & 0x7F200000U) == 0x1E000000U) {
         const u32 sf = i >> 31, ftype = (i >> 22) & 3;
         const u32 rmode = (i >> 19) & 3, opcode = (i >> 16) & 7;
         const u32 fbits = 64 - ((i >> 10) & 0x3F);
-        // fbits is fixed at translation time, so the scale is a literal rather
-        // than a call into libm. 2^n is exact in binary floating point for every
-        // n this encoding can name, so "%.1f" round-trips it without loss.
-        char scale_lit[64];
-        snprintf(scale_lit, sizeof scale_lit, "%.1f", std::pow(2.0, (double)fbits));
         const u32 rn = (i >> 5) & 31, rd = i & 31;
-        // A 32-bit destination only encodes scales that leave fbits in 1..32.
-        const bool shaped = (ftype == 0 || ftype == 1) && fbits >= 1 && (sf || fbits <= 32);
-        if (shaped) {
-            const bool dbl = (ftype == 1);
-            const char* ct = dbl ? "double" : "float";
-            const int fsz = dbl ? 8 : 4;
-                if (rmode == 3 && (opcode == 0 || opcode == 1) && rd != 31) {
-                const bool is_signed = (opcode == 0);
-                const char* it = sf ? (is_signed ? "int64_t" : "uint64_t")
-                                    : (is_signed ? "int32_t" : "uint32_t");
-                const char* lo_bound = sf ? (is_signed ? "-9223372036854775808.0" : "0.0")
-                                          : (is_signed ? "-2147483648.0" : "0.0");
-                const char* hi_bound = sf ? (is_signed ? "9223372036854775807.0"
-                                                       : "18446744073709551615.0")
-                                          : (is_signed ? "2147483647.0" : "4294967295.0");
-                const char* sat_lo = sf ? (is_signed ? "0x8000000000000000ULL" : "0ULL")
-                                        : (is_signed ? "0xFFFFFFFF80000000ULL" : "0ULL");
-                const char* sat_hi = sf ? (is_signed ? "0x7FFFFFFFFFFFFFFFULL"
-                                                     : "0xFFFFFFFFFFFFFFFFULL")
-                                        : (is_signed ? "0x7FFFFFFFULL" : "0xFFFFFFFFULL");
-                std::string s = "{ " + std::string(ct) + " _a; memcpy(&_a,&c->vreg[" +
-                                std::to_string(rn) + "][0]," + std::to_string(fsz) + "); ";
-                s += std::string("_a = _a * (") + ct + ")" + scale_lit + "; ";
-                s += "uint64_t _r; if (_a != _a) _r = 0ULL; ";
-                s += std::string("else if (!(_a > (") + ct + ")" + lo_bound + ")) _r = " + sat_lo + "; ";
-                s += std::string("else if (!(_a < (") + ct + ")" + hi_bound + ")) _r = " + sat_hi + "; ";
-                s += "else _r = (uint64_t)(" + std::string(it) + ")_a; ";
-                if (!sf) s += "_r &= 0xFFFFFFFFULL; ";
-                s += "c->x[" + std::to_string(rd) + "] = _r; }";
-                put(s);
-                return true;
-            }
-            if (rmode == 0 && (opcode == 2 || opcode == 3)) {
-                const std::string src = sf ? (opcode == 2 ? "(int64_t)" + Xz(rn)
-                                                          : "(uint64_t)" + Xz(rn))
-                                           : (opcode == 2 ? "(int32_t)" + Xz(rn)
-                                                          : "(uint32_t)" + Xz(rn));
-                std::string s = "{ double _t = (double)(" + src + "); ";
-                s += std::string(ct) + " _r = (" + ct + ")(_t / " + scale_lit + "); ";
-                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                     "][1]=0; ";
-                s += "memcpy(&c->vreg[" + std::to_string(rd) + "][0],&_r," +
-                     std::to_string(fsz) + "); }";
-                put(s);
-                return true;
-            }
+        const bool shaped = (ftype == 0 || ftype == 1) && (sf || fbits <= 32);
+        const bool to_fixed = rmode == 3 && (opcode == 0 || opcode == 1);
+        const bool to_float = rmode == 0 && (opcode == 2 || opcode == 3);
+        if (!shaped || (!to_fixed && !to_float)) {
+            put_unhandled();
+            return true;
         }
+        const std::string fw = ftype == 1 ? "64" : "32";
+        const std::string iw = sf ? "64" : "32";
+        const std::string is_signed = (opcode & 1) ? "0" : "1";
+        const std::string args = "," + fw + "," + iw + "," + std::to_string(fbits) +
+                                 "," + is_signed + ",c->fpcr,&c->fpsr)";
+        if (to_fixed) {
+            const std::string call = "recomp_fp_to_fixed(c->vreg[" +
+                                     std::to_string(rn) + "][0]" + args;
+            // Rd=31 is WZR/XZR, NOT SP. Conversion exceptions still happen.
+            put(rd == 31 ? "(void)" + call + ";"
+                         : "c->x[" + std::to_string(rd) + "]=" + call + ";");
+        } else {
+            put("{ uint64_t _r=recomp_fixed_to_fp(" + Xz(rn) + args +
+                "; c->vreg[" + std::to_string(rd) + "][0]=_r; c->vreg[" +
+                std::to_string(rd) + "][1]=0; }");
+        }
+        return true;
     }
 
     // FP <-> integer conversions and FMOV between register files. These share
@@ -2932,72 +3056,35 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         const u32 rn = (i >> 5) & 31, rd = i & 31;
         if (ftype == 0 || ftype == 1) {
             const bool dbl = (ftype == 1);
-            const char* ct = dbl ? "double" : "float";
             const int fsz = dbl ? 8 : 4;
             const std::string zero_d = "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" +
                                        std::to_string(rd) + "][1]=0; ";
 
-            // SCVTF / UCVTF: integer register -> FP register.
+            // SCVTF / UCVTF: integer register -> FP register, rounded in the
+            // guest FPCR mode with IXC, as the fixed-point forms with no
+            // fraction bits.
             if (rmode == 0 && (opcode == 2 || opcode == 3)) {
-                const std::string src = sf ? (opcode == 2 ? "(int64_t)" + Xz(rn)
-                                                          : "(uint64_t)" + Xz(rn))
-                                           : (opcode == 2 ? "(int32_t)" + Xz(rn)
-                                                          : "(uint32_t)" + Xz(rn));
-                put("{ " + std::string(ct) + " _r = (" + ct + ")(" + src + "); " + zero_d +
-                    "memcpy(&c->vreg[" + std::to_string(rd) + "][0],&_r," +
-                    std::to_string(fsz) + "); }");
+                put("{ uint64_t _r=recomp_fixed_to_fp(" + Xz(rn) + "," + std::to_string(fsz * 8) +
+                    "," + (sf ? "64" : "32") + ",0," + (opcode == 2 ? "1" : "0") +
+                    ",c->fpcr,&c->fpsr); " + zero_d + "c->vreg[" + std::to_string(rd) + "][0]=_r; }");
                 return true;
             }
 
             // FCVT{N,P,M,Z}{S,U} and FCVTA{S,U}: FP register -> integer register.
             // rmode names the rounding mode; FCVTA{S,U} is the odd one out,
             // encoded as opcode 4/5 with rmode 0 and rounding halfway cases away
-            // from zero.
+            // from zero. Round, then saturate (NaN gives 0), in integer fields:
+            // a bare C cast is undefined out of range, and host rounding
+            // follows the host FP mode. IOC/IXC/IDC as the architecture.
             const bool cvt_away = (rmode == 0 && (opcode == 4 || opcode == 5));
-            if ((opcode == 0 || opcode == 1 || cvt_away) && rd != 31) {
+            if (opcode == 0 || opcode == 1 || cvt_away) {
                 const bool is_signed = cvt_away ? (opcode == 4) : (opcode == 0);
-                const char* rnd = nullptr;
-                if (cvt_away) {
-                    rnd = dbl ? "round" : "roundf";
-                } else if (rmode == 0) {
-                    rnd = dbl ? "nearbyint" : "nearbyintf";
-                } else if (rmode == 1) {
-                    rnd = dbl ? "ceil" : "ceilf";
-                } else if (rmode == 2) {
-                    rnd = dbl ? "floor" : "floorf";
-                }
-                // rmode 3 needs no call: the cast below already truncates.
-                const char* it = sf ? (is_signed ? "int64_t" : "uint64_t")
-                                    : (is_signed ? "int32_t" : "uint32_t");
-                std::string s = "{ " + std::string(ct) + " _a; memcpy(&_a,&c->vreg[" +
-                                std::to_string(rn) + "][0]," + std::to_string(fsz) + "); ";
-                // Round before saturating, the order the architecture specifies.
-                if (rnd) s += std::string("_a = ") + rnd + "(_a); ";
-                // FCVTZS/FCVTZU saturate: NaN gives 0, and anything outside the
-                // destination's range clamps to that range's min or max. A bare
-                // C cast is undefined for exactly those inputs, and on x86 it
-                // compiles to cvttss2si, which answers "integer indefinite"
-                // (INT_MIN / LLONG_MIN) for NaN, +inf and -inf alike. Float-heavy
-                // game code converts out-of-range values constantly - clamped
-                // indices, hashes, fixed-point - so the wrong answer here is a
-                // steady drip of corruption rather than an immediate fault.
-                const char* lo_bound = sf ? (is_signed ? "-9223372036854775808.0" : "0.0")
-                                          : (is_signed ? "-2147483648.0" : "0.0");
-                const char* hi_bound = sf ? (is_signed ? "9223372036854775807.0"
-                                                       : "18446744073709551615.0")
-                                          : (is_signed ? "2147483647.0" : "4294967295.0");
-                const char* sat_lo = sf ? (is_signed ? "0x8000000000000000ULL" : "0ULL")
-                                        : (is_signed ? "0xFFFFFFFF80000000ULL" : "0ULL");
-                const char* sat_hi = sf ? (is_signed ? "0x7FFFFFFFFFFFFFFFULL"
-                                                     : "0xFFFFFFFFFFFFFFFFULL")
-                                        : (is_signed ? "0x7FFFFFFFULL" : "0xFFFFFFFFULL");
-                s += "uint64_t _r; if (_a != _a) _r = 0ULL; ";
-                s += std::string("else if (!(_a > (") + ct + ")" + lo_bound + ")) _r = " + sat_lo + "; ";
-                s += std::string("else if (!(_a < (") + ct + ")" + hi_bound + ")) _r = " + sat_hi + "; ";
-                s += "else _r = (uint64_t)(" + std::string(it) + ")_a; ";
-                if (!sf) s += "_r &= 0xFFFFFFFFULL; ";
-                s += "c->x[" + std::to_string(rd) + "] = _r; }";
-                put(s);
+                const std::string call = "recomp_fp_to_int(c->vreg[" + std::to_string(rn) + "][0]&" +
+                    (dbl ? "UINT64_MAX" : "UINT64_C(0xffffffff)") + "," + std::to_string(fsz * 8) + "," +
+                    (sf ? "64" : "32") + "," + (is_signed ? "1" : "0") + "," +
+                    std::to_string(cvt_away ? 4u : rmode) + ",c->fpcr,&c->fpsr)";
+                // Rd=31 is WZR/XZR; the conversion's exceptions still happen.
+                put(rd == 31 ? "(void)" + call + ";" : "c->x[" + std::to_string(rd) + "]=" + call + ";");
                 return true;
             }
 
@@ -3191,6 +3278,18 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         constexpr u32 kFpsr = 0x5A21;
         if (sysreg == kFpcr || sysreg == kFpsr) {
             const char* field = (sysreg == kFpcr) ? "fpcr" : "fpsr";
+            if (g_emit_fpx && sysreg == kFpcr) {
+                // FPX1: bit 32 of fpcr is the host's kill switch. The guest
+                // register is 32 bits, so it never sees the bit or clears it.
+                if (is_read) {
+                    if (rt != 31) {
+                        put("c->x[" + std::to_string(rt) + "] = c->fpcr & 0xffffffffULL;");
+                    }
+                } else {
+                    put("c->fpcr = (" + Xz(rt) + " & 0xffffffffULL) | (c->fpcr & RECOMP_FPX_INHIBIT);");
+                }
+                return true;
+            }
             if (is_read) {
                 if (rt != 31) {
                     put("c->x[" + std::to_string(rt) + "] = c->" + std::string(field) + ";");
@@ -3304,85 +3403,30 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
     }
 
     // Scalar FRECPS/FRSQRTS S/D, evaluated exactly before one rounding.
-    // A fixed multiword product lattice covers every finite input exponent.
-    // This deliberately favors correctness over speed; no host fma or
-    // intermediate halve can introduce double rounding. Baseline FP modes
-    // only: exception/access trap delivery and FEAT_AFP remain unsupported.
     if ((i & 0xFF20FC00) == 0x5E20FC00) {
         const bool dbl=(i&0x00400000)!=0,half=(i&0x00800000)!=0;
         const unsigned rd=i&31,rn=(i>>5)&31,rm=(i>>16)&31;
         const std::string ct=dbl?"uint64_t":"uint32_t",sz=dbl?"8":"4";
         put("{ "+ct+" _aa,_bb;memcpy(&_aa,c->vreg["+std::to_string(rn)+"],"+sz+
             ");memcpy(&_bb,c->vreg["+std::to_string(rm)+"],"+sz+
-            ");const unsigned _f="+(dbl?"52":"23")+",_bias="+(dbl?"1023":"127")+
-            ",_count="+(dbl?"67":"9")+";const int _base="+
-            std::to_string((dbl?-2148:-298)-(half?1:0))+";"
-            "const uint64_t _hidden=1ULL<<_f,_frac=_hidden-1,_quiet=_hidden>>1,_exp="+
-            (dbl?"0x7ff0000000000000ULL":"0x7f800000ULL")+",_sign="+
-            (dbl?"0x8000000000000000ULL":"0x80000000ULL")+";"
-            // FPNeg precedes NaN processing in the architectural pseudocode.
-            "uint64_t _a=(uint64_t)_aa^_sign,_b=_bb,_v=0;unsigned _mode=(unsigned)(c->fpcr>>22)&3;"
-            "if(c->fpcr&(1ULL<<24)) {if(!(_a&_exp)&&(_a&_frac)) {_a&=_sign;c->fpsr|=128;}"
-            "if(!(_b&_exp)&&(_b&_frac)) {_b&=_sign;c->fpsr|=128;}}"
-            "int _an=(_a&_exp)==_exp&&(_a&_frac),_bn=(_b&_exp)==_exp&&(_b&_frac);"
-            "if(_an||_bn) {int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
-            "_v=(_as?_a:_bs?_b:_an?_a:_b)|_quiet;if(_as||_bs) {c->fpsr|=1;}"
-            "if(c->fpcr&(1ULL<<25)) {_v=_exp|_quiet;}}"
-            "else if(((_a&_exp)==_exp&&!(_b&~_sign))||((_b&_exp)==_exp&&!(_a&~_sign)))"
-            "_v="+(dbl?(half?"0x3ff8000000000000ULL":"0x4000000000000000ULL"):
-                         (half?"0x3fc00000ULL":"0x40000000ULL"))+";"
-            "else if((_a&_exp)==_exp||(_b&_exp)==_exp)_v=_exp|((_a^_b)&_sign);"
-            "else {unsigned _ea=(unsigned)((_a&_exp)>>_f),_eb=(unsigned)((_b&_exp)>>_f);"
-            "uint64_t _ma=(_a&_frac)|(_ea?_hidden:0),_mb=(_b&_frac)|(_eb?_hidden:0);"
-            "uint64_t _p["+std::string(dbl?"67":"9")+"]={0},_c["+(dbl?"67":"9")+"]={0};"
-            "uint64_t _a0=(uint32_t)_ma,_a1=_ma>>32,_b0=(uint32_t)_mb,_b1=_mb>>32;"
-            "uint64_t _lo=_a0*_b0,_x=_a0*_b1,_y=_a1*_b0,_hi=_a1*_b1+(_x>>32)+(_y>>32);"
-            "uint64_t _old=_lo;_lo+=_x<<32;_hi+=_lo<_old;_old=_lo;_lo+=_y<<32;_hi+=_lo<_old;"
-            "unsigned _shift=(_ea?_ea-1:0)+(_eb?_eb-1:0),_j=_shift/64,_s=_shift%64;"
-            "_p[_j]=_lo<<_s;_p[_j+1]=(_hi<<_s)|(_s?_lo>>(64-_s):0);"
-            "if(_s&&_j+2<_count)_p[_j+2]=_hi>>(64-_s);"
-            "unsigned _bit="+std::string(dbl?"2149":"299")+";_c[_bit/64]|=1ULL<<(_bit%64);");
-        if(half)put("--_bit;_c[_bit/64]|=1ULL<<(_bit%64);");
-        put("unsigned _negative=0;"
-            "if((_a^_b)&_sign) {int _compare=0;for(int _k=(int)_count-1;_k>=0;--_k)"
-            "{if(_p[_k]!=_c[_k]) {_compare=_p[_k]>_c[_k]?1:-1;break;}}"
-            "_negative=_compare>0;uint64_t _borrow=0;for(unsigned _k=0;_k<_count;++_k)"
-            "{uint64_t _left=_negative?_p[_k]:_c[_k],_right=_negative?_c[_k]:_p[_k];"
-            "uint64_t _diff=_left-_right,_next=(_left<_right)||(_diff<_borrow);"
-            "_p[_k]=_diff-_borrow;_borrow=_next;}}"
-            "else {uint64_t _carry=0;for(unsigned _k=0;_k<_count;++_k)"
-            "{uint64_t _sum=_p[_k]+_c[_k],_next=_sum<_p[_k];"
-            "uint64_t _total=_sum+_carry;_carry=_next||_total<_sum;_p[_k]=_total;}}"
-            "int _top=recomp_fp_top_bit(_p,_count);"
-            "if(_top<0)_v=_mode==2?_sign:0;else {int _e=_top+_base,_emin=1-(int)_bias;"
-            "if(_e<_emin&&(c->fpcr&(1ULL<<24))) {c->fpsr|=8;_v=_negative?_sign:0;}"
-            "else {int _cut=_top-(int)_f,_mincut=_emin-(int)_f-_base;if(_cut<_mincut)_cut=_mincut;"
-            "unsigned _index=(unsigned)_cut/64,_offset=(unsigned)_cut%64;"
-            "uint64_t _mant=_p[_index]>>_offset;if(_offset&&_index+1<_count)_mant|=_p[_index+1]<<(64-_offset);"
-            "unsigned _roundbit=(unsigned)((_p[(unsigned)(_cut-1)/64]>>((_cut-1)%64))&1);"
-            "unsigned _sticky=recomp_fp_sticky(_p,_count,_cut);"
-            "unsigned _lost=_roundbit|_sticky;if(_lost) {c->fpsr|=16;if(_e<_emin)c->fpsr|=8;"
-            "if((_mode==0&&_roundbit&&(_sticky||(_mant&1)))||(_mode==1&&!_negative)||(_mode==2&&_negative))++_mant;}"
-            "if(_e<_emin)_e=_emin;if(_mant>=(_hidden<<1)) {_mant>>=1;++_e;}"
-            "if(_e>(int)_bias) {c->fpsr|=20;_v=(_mode==0||(_mode==1&&!_negative)||(_mode==2&&_negative))?_exp:_exp-1;}"
-            "else _v=(_mant>=_hidden?(uint64_t)(_e+(int)_bias)<<_f:0)|(_mant&_frac);"
-            "if(_negative)_v|=_sign;}}}c->vreg["+std::to_string(rd)+"][0]=_v;c->vreg["+
+            ");"+EmitFPStepValue(dbl,half)+"c->vreg["+std::to_string(rd)+"][0]=_v;c->vreg["+
             std::to_string(rd)+"][1]=0;}");
         return true;
     }
 
-    // FSQRT vector and FABD vector/scalar, S/D. Integer significands make
-    // rounding independent of host FP modes. Baseline DN/FZ/RMode and FPSR
-    // flags are supported; FP access/exception traps and FEAT_AFP are not.
+    // FSQRT vector/scalar and FABD vector/scalar, S/D. Integer significands
+    // make rounding independent of host FP modes. Baseline DN/FZ/RMode and
+    // FPSR flags are supported; FP access/exception traps and FEAT_AFP are not.
     {
-        const bool sqrt_vec = (i & 0xBFBFFC00) == 0x2EA1F800;
+        const bool sqrt_scalar = (i & 0xFFBFFC00) == 0x1E21C000;
+        const bool sqrt_vec = (i & 0xBFBFFC00) == 0x2EA1F800 || sqrt_scalar;
         const bool abd_vec = (i & 0xBFA0FC00) == 0x2EA0D400;
         const bool abd_scalar = (i & 0xFFA0FC00) == 0x7EA0D400;
         const bool dbl = ((i >> 22) & 1) != 0;
         const bool q = ((i >> 30) & 1) != 0;
-        if (((sqrt_vec || abd_vec) && (!dbl || q)) || abd_scalar) {
+        if (((sqrt_vec || abd_vec) && (!dbl || q || sqrt_scalar)) || abd_scalar) {
             const unsigned rd = i & 31, rn = (i >> 5) & 31, rm = (i >> 16) & 31;
-            const unsigned lanes = abd_scalar ? 1 : (q ? 16 : 8) / (dbl ? 8 : 4);
+            const unsigned lanes = abd_scalar || sqrt_scalar ? 1 : (q ? 16 : 8) / (dbl ? 8 : 4);
             const std::string ct = dbl ? "uint64_t" : "uint32_t";
             put("{ " + ct + " _n[" + std::string(dbl ? "2" : "4") + "],_m[" +
                 (dbl ? "2" : "4") + "],_r[" + (dbl ? "2" : "4") +
@@ -3390,7 +3434,8 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 "],16); memcpy(_m,c->vreg[" + std::to_string(rm) + "],16);");
             put("for(unsigned _lane=0;_lane<" + std::to_string(lanes) +
                 ";++_lane) { uint64_t _a=_n[_lane],_b=" +
-                std::string(sqrt_vec ? "0" : "_m[_lane]") + ",_v=0;"
+                std::string(sqrt_vec ? "0" : "_m[_lane]") + ",_v=0;" +
+                (sqrt_vec ? EmitFPNativeValue(dbl, "sqrt") : std::string()) +
                 " const unsigned _f=" + (dbl ? "52" : "23") + "; const uint64_t _hidden=1ULL<<_f,"
                 " _frac=_hidden-1,_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
                 ",_sign=" + (dbl ? "0x8000000000000000ULL" : "0x80000000ULL") +
@@ -3428,7 +3473,8 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             } else {
                 put("else " + EmitFPAddSubValue(dbl, true));
             }
-            put("_r[_lane]=(" + ct + ")(_v" + (sqrt_vec ? std::string("") : "&~_sign") +
+            put((sqrt_vec ? EmitFPNativeSuffix(dbl, "sqrt") : std::string()) +
+                "_r[_lane]=(" + ct + ")(_v" + (sqrt_vec ? std::string("") : "&~_sign") +
                 "); } memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
             return true;
         }
@@ -3464,29 +3510,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             };
             const auto emit_pair = [&](const std::string& a, const std::string& b,
                                        const std::string& dest) {
-                put("{ uint64_t _a=" + a + ",_b=" + b + ",_v; const uint64_t _sign=" +
-                    (dbl ? std::string("0x8000000000000000ULL") : "0x80000000ULL") +
-                    ",_exp=" + (dbl ? "0x7ff0000000000000ULL" : "0x7f800000ULL") +
-                    ",_frac=" + (dbl ? "0xfffffffffffffULL" : "0x7fffffULL") +
-                    ",_quiet=" + (dbl ? "0x8000000000000ULL" : "0x400000ULL") + ";");
-                put("if(c->fpcr & (1ULL<<24)) {"
-                    " if(!(_a&_exp)&&(_a&_frac)) { _a&=_sign; c->fpsr|=128; }"
-                    " if(!(_b&_exp)&&(_b&_frac)) { _b&=_sign; c->fpsr|=128; } }");
-                put("{ int _an=(_a&_exp)==_exp&&(_a&_frac),"
-                    " _bn=(_b&_exp)==_exp&&(_b&_frac);"
-                    " int _as=_an&&!(_a&_quiet),_bs=_bn&&!(_b&_quiet);"
-                    " if(_as||_bs) { c->fpsr|=1; _v=(_as?_a:_b)|_quiet; }");
-                if (numeric) {
-                    put("else if(_an&&!_bn) _v=_b; else if(_bn&&!_an) _v=_a;");
-                }
-                put("else if(_an||_bn) _v=(_an?_a:_b)|_quiet;"
-                    " else if(!((_a|_b)&~_sign)) _v=" +
-                    std::string(minimum ? "(_a|_b)" : "(_a&_b)") + ";"
-                    " else { int _less=((_a^_b)&_sign)?!!(_a&_sign):"
-                    " ((_a&_sign)?_a>_b:_a<_b); _v=" +
-                    std::string(minimum ? "(_less?_a:_b)" : "(_less?_b:_a)") + "; }");
-                put("if((c->fpcr&(1ULL<<25))&&((_v&_exp)==_exp)&&(_v&_frac))"
-                    " { _v=_exp|_quiet; } " + dest + "=(" + ct + ")_v; } }");
+                put(EmitFPMinMax(dbl, minimum, numeric, a, b, dest + "=(" + ct + ")_v;"));
             };
             if (reduce) {
                 // Architectural reduction is a balanced tree, not a left fold:
@@ -3701,19 +3725,25 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
         return true;
     }
 
-    // Vector integral rounding, using integer IEEE-754 fields so guest rounding
-    // and subnormal modes do not depend on the host floating-point environment.
+    // Vector and scalar integral rounding (FRINT{N,P,M,Z,A,X,I}), using integer
+    // IEEE-754 fields so guest rounding and subnormal modes do not depend on
+    // the host floating-point environment.
     {
         const u32 key = i & 0xBFBFFC00;
+        const u32 sop = (i >> 15) & 0x3F;
+        const bool scalar = (i & 0xFFA07C00) == 0x1E204000 && ((sop >= 8 && sop <= 12) || sop == 14 || sop == 15);
         const bool rounding = key == 0x0E218800 || key == 0x0EA18800 ||
             key == 0x0E219800 || key == 0x0EA19800 || key == 0x2E218800 ||
             key == 0x2E219800 || key == 0x2EA19800;
         const bool dbl = (i & (1U << 22)) != 0, q = (i & (1U << 30)) != 0;
-        if (rounding && (!dbl || q)) {
+        if ((rounding && (!dbl || q)) || scalar) {
             const unsigned rd = i & 31, rn = (i >> 5) & 31;
-            const unsigned lanes = dbl ? 2 : 4, active = q ? lanes : lanes / 2;
+            const unsigned lanes = dbl ? 2 : 4, active = scalar ? 1 : q ? lanes : lanes / 2;
             const std::string ct = dbl ? "uint64_t" : "uint32_t";
-            const std::string mode = key == 0x0E218800 ? "0" : key == 0x0EA18800 ? "1" :
+            const bool exact_flag = scalar ? sop == 14 : key == 0x2E219800;  // FRINTX
+            const std::string mode = scalar
+                ? (sop <= 12 ? std::to_string(sop - 8) : std::string("((c->fpcr>>22)&3)"))
+                : key == 0x0E218800 ? "0" : key == 0x0EA18800 ? "1" :
                 key == 0x0E219800 ? "2" : key == 0x0EA19800 ? "3" :
                 key == 0x2E218800 ? "4" : "((c->fpcr>>22)&3)";
             put("{ " + ct + " _src[" + std::to_string(lanes) + "],_dst[" +
@@ -3742,7 +3772,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 " _up=_lost&&(_mode==0?(_lost>(_unit>>1)||(_lost==(_unit>>1)&&(_a&_unit))):"
                 " _mode==4?_lost>=(_unit>>1):_mode==1?!(_v&_sign):_mode==2?!!(_v&_sign):0);"
                 " _r=(_v&_sign)|((_a&~_mask)+(_up?_unit:0)); } }");
-            if (key == 0x2E219800) put("if(_r!=_v) c->fpsr|=16;");
+            if (exact_flag) put("if(_r!=_v) c->fpsr|=16;");
             put("} _dst[_j]=(" + ct + ")_r; } memcpy(c->vreg[" +
                 std::to_string(rd) + "],_dst,16); }");
             return true;
@@ -3777,7 +3807,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             ");memcpy(&_b,c->vreg["+std::to_string(rm)+"],"+sz+");_z=(_a^_b)&"+
             std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+";");
         if(divide)put("(void)_z;");
-        put(divide?EmitFPDivideValue(dbl):EmitFPMulAddValue(dbl));
+        put(divide?EmitFPDivideValue(dbl):EmitFPMulAddValue(dbl,true));
         // FNMUL negates the rounded product, including NaN/zero sign. Moving
         // this sign change to an input would reverse directed rounding.
         if(negate)put("_v^="+std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+";");
@@ -3833,23 +3863,18 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 return true;
             }
 
-            // Remaining two-source scalar operations (opcode in bits 15..12).
-            if (((i >> 10) & 3) == 2) {
+            // FMAX/FMIN/FMAXNM/FMINNM (opcode 4-7 in bits 15..12): the SIMD
+            // forms' exact core. Host comparisons and fmax/fmin got signed
+            // zeros, NaN selection and the FPSR wrong.
+            if (((i >> 10) & 3) == 2 && ((i >> 12) & 15) >= 4 && ((i >> 12) & 15) <= 7) {
                 const u32 opcode = (i >> 12) & 15;
-                // FMAX/FMIN propagate a NaN operand; the NM forms return the
-                // other operand instead, which is exactly what fmax/fmin do.
-                std::string expr2;
-                switch (opcode) {
-                case 4: expr2 = "(_a!=_a||_b!=_b) ? (_a+_b) : (_a>_b?_a:_b)"; break;  // FMAX
-                case 5: expr2 = "(_a!=_a||_b!=_b) ? (_a+_b) : (_a<_b?_a:_b)"; break;  // FMIN
-                case 6: expr2 = dbl ? "fmax(_a,_b)" : "fmaxf(_a,_b)"; break;          // FMAXNM
-                case 7: expr2 = dbl ? "fmin(_a,_b)" : "fminf(_a,_b)"; break;          // FMINNM
-                default: break;
-                }
-                if (!expr2.empty()) {
-                    put(ld_n + ld_m + "_r = " + expr2 + "; " + st_d);
-                    return true;
-                }
+                put("{ uint64_t _n=0,_m=0,_r; memcpy(&_n,c->vreg[" + std::to_string(rn) + "]," +
+                    std::to_string(sz) + "); memcpy(&_m,c->vreg[" + std::to_string(rm) + "]," +
+                    std::to_string(sz) + ");");
+                put(EmitFPMinMax(dbl, (opcode & 1) != 0, opcode >= 6, "_n", "_m", "_r=_v;"));
+                put("c->vreg[" + std::to_string(rd) + "][0]=_r; c->vreg[" + std::to_string(rd) +
+                    "][1]=0; }");
+                return true;
             }
 
             // FCVT between precisions. It shares the one-source encoding but
@@ -3874,7 +3899,8 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 }
             }
 
-            // One-source: FMOV/FABS/FNEG/FSQRT (opcode in bits 20..15 low bits).
+            // One-source: FMOV/FABS/FNEG (opcode in bits 20..15 low bits).
+            // FSQRT and FRINT* are decoded exactly above.
             if (((i >> 10) & 0x1F) == 0x10) {
                 const u32 opcode = (i >> 15) & 0x3F;
                 std::string expr;
@@ -3882,16 +3908,6 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 case 0: expr = "_a"; break;                             // FMOV
                 case 1: expr = dbl ? "fabs(_a)" : "fabsf(_a)"; break;   // FABS
                 case 2: expr = "-_a"; break;                            // FNEG
-                case 3: expr = dbl ? "sqrt(_a)" : "sqrtf(_a)"; break;   // FSQRT
-                // FRINTN, FRINTX and FRINTI all round to nearest-even under the
-                // default FPCR, which is the only mode the exported code runs in.
-                case 8:
-                case 14:
-                case 15: expr = dbl ? "nearbyint(_a)" : "nearbyintf(_a)"; break;
-                case 9: expr = dbl ? "ceil(_a)" : "ceilf(_a)"; break;    // FRINTP
-                case 10: expr = dbl ? "floor(_a)" : "floorf(_a)"; break; // FRINTM
-                case 11: expr = dbl ? "trunc(_a)" : "truncf(_a)"; break; // FRINTZ
-                case 12: expr = dbl ? "round(_a)" : "roundf(_a)"; break; // FRINTA
                 default: break;
                 }
                 if (!expr.empty()) {
@@ -3903,15 +3919,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // FCCMP / FCCMPE: compare when the condition holds, otherwise take
             // the flags straight from nzcv. Bits 11..10 are 01 here, where an
             // ordinary FCMP has 1000 in bits 13..10, so the two do not overlap.
+            // Bit 4 selects the signalling form.
             if (((i >> 10) & 3) == 1) {
                 const u32 cond = (i >> 12) & 15, nzcv = i & 15;
                 std::string s = "{ if " + Cond(cond) + " ";
-                s += ld_n + ld_m;
-                s += "if (_a != _a || _b != _b) { c->n=0; c->z=0; c->c=1; c->v=1; } ";
-                s += "else { c->n = (_a < _b); c->z = (_a == _b); "
-                     "c->c = (_a >= _b); c->v = 0; } ";
-                s += "(void)_r; } ";
-                s += "else { c->n=" + std::to_string((nzcv >> 3) & 1) + "; ";
+                s += EmitFPCompareFlags(dbl, ((i >> 4) & 1) != 0,
+                                        "c->vreg[" + std::to_string(rn) + "]",
+                                        "c->vreg[" + std::to_string(rm) + "]");
+                s += " else { c->n=" + std::to_string((nzcv >> 3) & 1) + "; ";
                 s += "c->z=" + std::to_string((nzcv >> 2) & 1) + "; ";
                 s += "c->c=" + std::to_string((nzcv >> 1) & 1) + "; ";
                 s += "c->v=" + std::to_string(nzcv & 1) + "; } }";
@@ -3922,23 +3937,14 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
             // FCMP / FCMPE, including the compare-against-zero forms. The
             // low five bits are opcode2: bit 3 selects the #0.0 variant (Rm is
             // then not a register at all) and bit 4 selects the signalling
-            // form, which differs only in how it reports NaNs and so produces
-            // the same flags here. Requiring all five to be clear, as before,
-            // matched only a quarter of the compares in real code.
+            // form, which raises IOC for a quiet NaN as well. Requiring all
+            // five to be clear, as before, matched only a quarter of the
+            // compares in real code.
             if (((i >> 10) & 0xF) == 8 && ((i >> 14) & 3) == 0 && (i & 7) == 0) {
                 const bool cmp_zero = ((i >> 3) & 1) != 0;
-                std::string s = ld_n;
-                if (cmp_zero) {
-                    s += std::string("_b = (") + ct + ")0; ";
-                } else {
-                    s += ld_m;
-                }
-                // Unordered (either NaN) sets C and V per the architecture.
-                s += "if (_a != _a || _b != _b) { c->n=0; c->z=0; c->c=1; c->v=1; } ";
-                s += "else { c->n = (_a < _b); c->z = (_a == _b); "
-                     "c->c = (_a >= _b); c->v = 0; } ";
-                s += "(void)_r; }";
-                put(s);
+                put(EmitFPCompareFlags(dbl, ((i >> 4) & 1) != 0,
+                                       "c->vreg[" + std::to_string(rn) + "]",
+                                       cmp_zero ? std::string() : "c->vreg[" + std::to_string(rm) + "]"));
                 return true;
             }
         }
@@ -4079,21 +4085,17 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 return true;
             }
             if (opcode == 0x1D && (i & (1U << 23)) == 0) {
-                const char* ct = dbl ? "double" : "float";
+                // SCVTF/UCVTF per lane, rounded in the guest FPCR mode with IXC.
                 const int fsz = dbl ? 8 : 4;
                 const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
                 const int lanes = bytes / fsz;
-                const std::string ity = std::string(U ? "uint" : "int") +
-                                        std::to_string(fsz * 8) + "_t";
-                std::string s = "{ " + ity + " _a[" + std::to_string(lanes) + "]; " +
-                                std::string(ct) + " _r[" + std::to_string(lanes) + "]; ";
-                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
-                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(" +
-                     std::string(ct) + ")_a[_i]; ";
-                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                     "][1]=0; ";
-                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
-                put(s);
+                const std::string uty = dbl ? "uint64_t" : "uint32_t", count = dbl ? "2" : "4";
+                const std::string w = std::to_string(fsz * 8);
+                put("{ " + uty + " _a[" + count + "],_r[" + count + "]={0}; memcpy(_a,c->vreg[" +
+                    std::to_string(rn) + "],16); for(int _i=0;_i<" + std::to_string(lanes) +
+                    ";_i++) _r[_i]=(" + uty + ")recomp_fixed_to_fp(_a[_i]," + w + "," + w + ",0," +
+                    (U ? "0" : "1") + ",c->fpcr,&c->fpsr); memcpy(c->vreg[" + std::to_string(rd) +
+                    "],_r,16); }");
                 return true;
             }
             // FABS/FNEG share opcode 0x0F; U selects negation. Opcode 0x0E
@@ -4145,43 +4147,20 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 }
             }
 
-            // FCVTZS / FCVTZU, vector. Round toward zero and saturate, the same
-            // contract as the scalar forms further up.
+            // FCVTZS / FCVTZU (bit 23 set) and FCVTMS / FCVTMU (bit 23 clear),
+            // vector and scalar: round toward zero or minus infinity, then
+            // saturate, the same contract as the general-register forms.
             if (opcode == 0x1B) {
-                const char* ct = dbl ? "double" : "float";
                 const int fsz = dbl ? 8 : 4;
                 const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
                 const int lanes = bytes / fsz;
-                const std::string ity =
-                    (U ? std::string("uint") : std::string("int")) + std::to_string(fsz * 8) + "_t";
-                const std::string uty = "uint" + std::to_string(fsz * 8) + "_t";
-                const char* lo_bound = dbl ? (U ? "0.0" : "-9223372036854775808.0")
-                                           : (U ? "0.0" : "-2147483648.0");
-                const char* hi_bound = dbl ? (U ? "18446744073709551615.0"
-                                                : "9223372036854775807.0")
-                                           : (U ? "4294967295.0" : "2147483647.0");
-                const char* sat_lo = dbl ? (U ? "0ULL" : "0x8000000000000000ULL")
-                                         : (U ? "0ULL" : "0xFFFFFFFF80000000ULL");
-                const char* sat_hi = dbl ? (U ? "0xFFFFFFFFFFFFFFFFULL"
-                                              : "0x7FFFFFFFFFFFFFFFULL")
-                                         : (U ? "0xFFFFFFFFULL" : "0x7FFFFFFFULL");
-                std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) + "]; " +
-                                uty + " _r[" + std::to_string(lanes) + "]; ";
-                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) +
-                     "); ";
-                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++){ " + std::string(ct) +
-                     " _v=_a[_i]; ";
-                s += "if(_v!=_v) _r[_i]=(" + uty + ")0; ";
-                s += std::string("else if(!(_v > (") + ct + ")" + lo_bound + ")) _r[_i]=(" + uty +
-                     ")" + sat_lo + "; ";
-                s += std::string("else if(!(_v < (") + ct + ")" + hi_bound + ")) _r[_i]=(" + uty +
-                     ")" + sat_hi + "; ";
-                s += "else _r[_i]=(" + uty + ")(" + ity + ")_v; } ";
-                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                     "][1]=0; ";
-                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) +
-                     "); }";
-                put(s);
+                const std::string uty = dbl ? "uint64_t" : "uint32_t", count = dbl ? "2" : "4";
+                const std::string w = std::to_string(fsz * 8);
+                put("{ " + uty + " _a[" + count + "],_r[" + count + "]={0}; memcpy(_a,c->vreg[" +
+                    std::to_string(rn) + "],16); for(int _i=0;_i<" + std::to_string(lanes) +
+                    ";_i++) _r[_i]=(" + uty + ")recomp_fp_to_int(_a[_i]," + w + "," + w + "," +
+                    (U ? "0" : "1") + "," + ((i & (1U << 23)) ? "3" : "2") +
+                    ",c->fpcr,&c->fpsr); memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
                 return true;
             }
 
@@ -4265,22 +4244,22 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 }
             }
             if (cmp) {
-                const char* ct = dbl ? "double" : "float";
+                // Against +0.0: LE and LT are GE and GT with the operands
+                // swapped, which is how the architecture defines them.
                 const int fsz = dbl ? 8 : 4;
                 // A scalar form touches one lane; a vector form covers the
                 // whole selected width.
                 const int bytes = scl_misc ? fsz : (Q ? 16 : 8);
                 const int lanes = bytes / fsz;
-                const std::string uty = "uint" + std::to_string(fsz * 8) + "_t";
-                std::string s = "{ " + std::string(ct) + " _a[" + std::to_string(lanes) + "]; " +
-                                uty + " _r[" + std::to_string(lanes) + "]; ";
-                s += "memcpy(_a,c->vreg[" + std::to_string(rn) + "]," + std::to_string(bytes) + "); ";
-                s += "for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) _r[_i]=(_a[_i]" + cmp +
-                     "(" + ct + ")0) ? (" + uty + ")~(" + uty + ")0 : (" + uty + ")0; ";
-                s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
-                     "][1]=0; ";
-                s += "memcpy(c->vreg[" + std::to_string(rd) + "],_r," + std::to_string(bytes) + "); }";
-                put(s);
+                const std::string uty = dbl ? "uint64_t" : "uint32_t", count = dbl ? "2" : "4";
+                const std::string op = cmp;
+                const bool swap = op == "<=" || op == "<";
+                const char* kind = op == "==" ? "eq" : (op == ">=" || op == "<=") ? "ge" : "gt";
+                put("{ " + uty + " _n[" + count + "],_r[" + count + "]={0}; memcpy(_n,c->vreg[" +
+                    std::to_string(rn) + "],16); for(int _i=0;_i<" + std::to_string(lanes) + ";_i++) " +
+                    EmitFPCompareMask(dbl, kind, swap ? "0" : "_n[_i]", swap ? "_n[_i]" : "0",
+                                      "_r[_i]=(" + uty + ")_v;") +
+                    " memcpy(c->vreg[" + std::to_string(rd) + "],_r,16); }");
                 return true;
             }
         }
@@ -4323,7 +4302,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                 const std::string sign=dbl?"0x8000000000000000ULL":"0x80000000ULL";
                 if(idxop==9)s+="_z=(_a^_b)&"+sign+";";
                 if(idxop==5)s+="_a^="+sign+";";
-                s+=EmitFPMulAddValue(dbl);
+                s+=EmitFPMulAddValue(dbl,idxop==9);
                 s+="_r[_i]=("+std::string(ct)+")_v;}}";
                 s += "c->vreg[" + std::to_string(rd) + "][0]=0; c->vreg[" + std::to_string(rd) +
                      "][1]=0; ";
@@ -4758,7 +4737,7 @@ inline bool Translate(u32 i, u64 pc, std::string& out, bool* unhandled = nullptr
                     "memcpy(_m,c->vreg["+std::to_string(rm)+"],"+std::to_string(vbytes)+");"
                     "for(unsigned _j=0;_j<"+std::to_string(fne)+";++_j){uint64_t _a=_n[_j],_b=_m[_j],_z=(_a^_b)&"+
                     std::string(dbl?"0x8000000000000000ULL":"0x80000000ULL")+",_v;");
-                put(EmitFPMulAddValue(dbl));
+                put(EmitFPMulAddValue(dbl,true));
                 put("_d[_j]=("+ty+")_v;}memcpy(c->vreg["+std::to_string(rd)+"],_d,"+std::to_string(vbytes)+");");
                 if(!Q)put("c->vreg["+std::to_string(rd)+"][1]=0;");
                 put("}");
@@ -5116,7 +5095,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
                                   // Addresses of this module's exported dynsym symbols, so
                                   // block discovery seeds a root at each even when nothing in
                                   // this module's own .text branches there directly.
-                                  const std::vector<u64>* extra_roots = nullptr) {
+                                  const std::vector<u64>* extra_roots = nullptr,
+                                  // Internal fixture control; production exports use 32 MiB.
+                                  size_t unit_source_limit = 32u << 20) {
     RecompileStats stats;
     auto blocks = DiscoverBlocks(text, n_bytes, base, entry_pc, extra_roots);
     const u32* p = reinterpret_cast<const u32*>(text);
@@ -5129,13 +5110,8 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     // up outright. Splitting keeps each unit to a sane size and lets the build
     // compile them in parallel.
     constexpr size_t kBlocksPerUnit = 20000;
-    const size_t unit_count =
-        blocks.empty() ? 1 : (blocks.size() + kBlocksPerUnit - 1) / kBlocksPerUnit;
-    // Written straight to disk rather than buffered. A whole module is over a
-    // gigabyte of C, and holding every unit in memory before writing meant the
-    // exporter needed that much RAM on top of the game's own data - enough that
-    // exporting a large title died partway, after the biggest module and before
-    // the rest, leaving an incomplete and inconsistent set of images behind.
+    // Retain only the current bounded unit and one block's rendered body.
+    // Buffering a whole module would require gigabytes on top of game data.
     const auto make_dir = [](const std::string& dir) {
         std::error_code ec;
         std::filesystem::create_directories(Utf8Path(dir), ec);
@@ -5145,39 +5121,16 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     // to the few files a human reads.
     const std::string src_dir = out_dir + "/src";
     make_dir(src_dir);
-    std::vector<std::ofstream> units;
-    units.reserve(unit_count);
-    for (size_t u = 0; u < unit_count; ++u) {
-        units.emplace_back(Utf8Path(src_dir + "/recompiled_" + mod + "_" + std::to_string(u) + ".c"),
-                           std::ios::binary);
-        units.back() << "/* auto-generated by suyu static recompiler - DO NOT EDIT */\n"
-                        "#include \"recomp_runtime.h\"\n"
-                        "#include <stdint.h>\n"
-                        "#include <string.h>\n"   // memcpy, used by the scalar FP paths
-                        "#include <math.h>\n"
-                        "struct _recomp_ent{uint64_t lo,hi; BlockFn fn;};\n\n";
-        if (u == 0) units.back() << "int g_recomp_guard_host_v2=0;\n";
-    }
-
-    // Each unit accumulates into a string and is written out in large blocks.
-    // Streaming every fragment through operator<< meant a sentry construction
-    // and a virtual xsputn per token (several per instruction) straight into a
-    // default 4 KiB filebuf; batching turns the whole emit into a handful of
-    // multi-megabyte writes per unit at no cost in output bytes.
-    // Blocks are visited in unit order, so a single buffer serves every unit -
-    // one buffer per unit would cost hundreds of megabytes of slack on a title
-    // that emits hundreds of units.
-    constexpr size_t kUnitFlushBytes = 8u << 20;
+    // Render one complete block before deciding which unit owns it. Block counts
+    // alone do not bound source size: exact vector FP bodies can expand one
+    // guest instruction into kilobytes of C. Retain every block, but isolate a
+    // single block exceeding the budget rather than silently dropping code.
+    std::string unit_body;
+    size_t unit_first = 0;
+    size_t unit_blocks = 0;
     std::string rcu;
-    rcu.reserve(kUnitFlushBytes + (1u << 20));
-    const auto flush_unit = [&](size_t u, bool force) {
-        if (rcu.size() >= kUnitFlushBytes || (force && !rcu.empty())) {
-            units[u].write(rcu.data(), (std::streamsize)rcu.size());
-            rcu.clear();
-        }
-    };
+    rcu.reserve(4096);
 
-    size_t block_index = 0;
     // Hoisted out of the per-instruction loop: a fresh std::string per guest
     // instruction is one allocation per instruction across the whole title.
     std::string body;
@@ -5192,36 +5145,53 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     // the build and a plausible way for it to die outright. Here the entries
     // sit next to the definitions they point at, so they cost no extra
     // declarations and compile across every core with the bodies.
-    std::vector<u64> seg_hi(unit_count, 0);
+    std::vector<u64> seg_hi;
     const auto emit_seg = [&](size_t u) {
-        const size_t lo = u * kBlocksPerUnit;
-        size_t hi = lo + kBlocksPerUnit;
-        if (hi > blocks.size()) {
-            hi = blocks.size();
-        }
+        const size_t lo = unit_first;
+        const size_t hi = lo + unit_blocks;
         char line[160];
         snprintf(line, sizeof line, "\nconst struct _recomp_ent _seg_%s_%zu[] = {\n", mod.c_str(),
                  u);
-        rcu += line;
+        unit_body += line;
         for (size_t i = lo; i < hi; ++i) {
             FuncNameTo(namebuf, mod.c_str(), blocks[i].vaddr);
             snprintf(line, sizeof line, "  {0x%llxULL, 0x%llxULL, %s},\n",
                      (unsigned long long)blocks[i].vaddr,
                      (unsigned long long)(blocks[i].vaddr + (u64)(blocks[i].count - 1) * 4),
                      namebuf);
-            rcu += line;
+            unit_body += line;
         }
         // C has no empty initialiser list; a zero-length segment still needs a
         // well-formed array, and its declared count of 0 keeps it unsearchable.
         if (lo >= hi) {
-            rcu += "  {0ULL, 0ULL, 0}\n";
+            unit_body += "  {0ULL, 0ULL, 0}\n";
+            seg_hi.push_back(0);
         } else {
             const auto& last = blocks[hi - 1];
-            seg_hi[u] = last.vaddr + (u64)(last.count - 1) * 4;
+            seg_hi.push_back(last.vaddr + (u64)(last.count - 1) * 4);
         }
         snprintf(line, sizeof line, "};\nconst unsigned _segn_%s_%zu = %zuU;\n", mod.c_str(), u,
                  hi - lo);
-        rcu += line;
+        unit_body += line;
+    };
+    const auto finish_unit = [&] {
+        const size_t u = seg_hi.size();
+        emit_seg(u);
+        std::ofstream output(Utf8Path(src_dir + "/recompiled_" + mod + "_" +
+                                     std::to_string(u) + ".c"), std::ios::binary);
+        output << "/* auto-generated by suyu static recompiler - DO NOT EDIT */\n"
+                  "#include \"recomp_runtime.h\"\n#include <stdint.h>\n"
+                  "#include <string.h>\n#include <math.h>\n"
+                  "struct _recomp_ent{uint64_t lo,hi; BlockFn fn;};\n\n";
+        if (u == 0) output << "int g_recomp_guard_host_v2=0;\n";
+        if (EmitGuardGen()) {
+            output << "static uint32_t recomp_gg_seen[" << std::max<size_t>(unit_blocks, 1)
+                   << "];\n";
+        }
+        output.write(unit_body.data(), static_cast<std::streamsize>(unit_body.size()));
+        unit_body.clear();
+        unit_first += unit_blocks;
+        unit_blocks = 0;
     };
 
     // Every block's address, so a direct branch can be turned into a direct call
@@ -5240,46 +5210,37 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         }
     } chain_scope;
 
-    size_t cur_unit = 0;
     for (const auto& b : blocks) {
-        const size_t unit = block_index / kBlocksPerUnit;
-        if (unit != cur_unit) {
-            emit_seg(cur_unit);
-            flush_unit(cur_unit, true);
-            cur_unit = unit;
-        }
-        ++block_index;
+        rcu.clear();
         FuncNameTo(namebuf, mod.c_str(), b.vaddr);
         rcu += "void ";
         rcu += namebuf;
         rcu += "(GuestContext* c){\n";
         const u32 first = (u32)((b.vaddr - base) / 4);
         rcu += "    static const uint32_t _expected[]={";
+        if (EmitGuardGen()) {
+            // GG1 header: word count, module-relative PC low and high.
+            char header[64];
+            snprintf(header, sizeof header, "%uU,0x%08xU,0x%08xU,", b.count,
+                     (unsigned)(b.vaddr & 0xffffffffu), (unsigned)(b.vaddr >> 32));
+            rcu += header;
+        }
         for (u32 k = 0; k < b.count; ++k) {
             char word[32]; snprintf(word, sizeof word, "0x%08xU,", p[first + k]); rcu += word;
         }
-        // Verify on the first entry, and after that only when the host says
-        // guest code may have changed. Checking the bytes on every entry made
-        // the guard the largest single cost in the frame: it ran before any
-        // guest work, and cost either a callback per instruction or a memcmp of
-        // the whole block. Comparing one counter replaces both.
-        //
-        // This keeps the guarantee the guard actually claims - synchronized
-        // instruction fetch - because on AArch64 the guest cannot synchronize
-        // new code without IC IVAU, and the host bumps the generation there, on
-        // any cache-range invalidation, on a full icache flush, and on every
-        // page-table refresh. What it does not do, and never did, is catch
-        // another thread rewriting a block while that block executes.
-        rcu += "};\n"
-               "    static uint64_t _guard_seen=0;\n"
-               "    { /* +1 so a fresh block never matches generation zero. */\n"
-               "      const uint64_t _gen=(c->host_mem&&c->host_mem->guard_generation)\n"
-               "          ? *c->host_mem->guard_generation+1 : 1;\n"
-               "      if(_guard_seen!=_gen){\n"
-               "        recomp_code_guard(c,g_module_base+" + std::to_string(b.vaddr) +
-               "ULL,_expected," + std::to_string(b.count) + "U,g_recomp_guard_host_v2);\n"
-               "        _guard_seen=_gen;\n"
-               "      } }\n";
+        // Verify each entry, including side entries and direct chains. Do not
+        // cache this in a function-static variable: multiple guest cores can
+        // enter the same generated block. Per-entry verification also handles
+        // process reuse and remapped addresses without an unsafe shared epoch.
+        if (EmitGuardGen()) {
+            // GG1: the same check, skipped while this block's seen word (its
+            // slot of the unit's recomp_gg_seen) matches the module generation.
+            rcu += "};\n    RECOMP_GG_GUARD(_expected,@GG_SLOT@U);\n";
+        } else {
+            rcu += "};\n    recomp_code_guard(c,g_module_base+" + std::to_string(b.vaddr) +
+                   "ULL,_expected," + std::to_string(b.count) + "U,g_recomp_guard_host_v2);\n";
+        }
+        rcu += "    if(c->halted) return;\n";
         // Lookup indexes every emitted instruction, not only block starts. An
         // indirect transfer can therefore enter the middle of this function.
         // Direct chains publish their exact target PC before calling, so any
@@ -5350,10 +5311,22 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
             rcu += tail;
         }
         rcu += "}\n\n";
-        flush_unit(unit, false);
+        // Reserve conservative space for the unit header and dispatch entries.
+        // The actual table lines fit in emit_seg's 160-byte buffer.
+        const size_t projected = unit_body.size() + rcu.size() +
+                                 (unit_blocks + 1) * 160 + 512;
+        if (unit_blocks && (unit_blocks == kBlocksPerUnit || projected > unit_source_limit)) {
+            finish_unit();
+        }
+        if (EmitGuardGen()) {
+            const size_t slot = rcu.find("@GG_SLOT@");
+            rcu.replace(slot, sizeof("@GG_SLOT@") - 1, std::to_string(unit_blocks));
+        }
+        unit_body += rcu;
+        ++unit_blocks;
     }
-    emit_seg(cur_unit);
-    flush_unit(cur_unit, true);
+    finish_unit();
+    const size_t unit_count = seg_hi.size();
 
     // The dispatch table is now just a directory of the per-unit segments
     // emitted above: a few lines per unit instead of two entries per block, so
@@ -5620,10 +5593,11 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     }
     cm << ")\n\n"
        << "# Generated block bodies are huge flat switch/if chains translated\n"
-       << "# straight from machine code - there's no loop nesting or hot path for\n"
-       << "# -O2 to meaningfully improve, just a lot of blocks for it to chew\n"
-       << "# through. Compiling them at -O1 cuts single-TU compile time sharply\n"
-       << "# on large modules with no measurable runtime cost.\n"
+       << "# straight from machine code. They were compiled at -O1 on the belief\n"
+       << "# that -O2 gains nothing here; measured on MK8D, -O2 (/O2 with MSVC)\n"
+       << "# races ~13% faster on x64 Windows and ~11% on arm64 macOS for ~25%\n"
+       << "# longer compiles. MSVC needs /bigobj at /O2: the units exceed the\n"
+       << "# default COFF section limit (C1128).\n"
        << "if(MSVC)\n"
        // /MP is what actually decides wall-clock time here. The Visual Studio
        // generator compiles the files of a single project strictly in
@@ -5639,8 +5613,11 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        // set) turns "unused local" into a hard build failure; the codegen
        // legitimately computes and drops _r on some flag-only paths, so
        // downgrade it back to a warning for generated sources specifically.
-       << "  set(_recomp_msvc_opts \"/O1\" \"/WX-\" \"/wd4127\" \"/wd4723\" \"/wd4102\" "
+       << "  set(_recomp_msvc_opts \"/O2\" \"/bigobj\" \"/WX-\" \"/wd4127\" \"/wd4723\" \"/wd4102\" "
           "\"/wd4101\" \"/wd4189\" \"/wd4456\" \"/wd4457\" \"/wd4459\")\n"
+       // FPX1's fast paths need IEEE arithmetic; fast-math compiles them out
+       // (RECOMP_FPX_HOST 0), so pin the model rather than inherit one.
+       << (g_emit_fpx ? "  list(APPEND _recomp_msvc_opts \"/fp:precise\")\n" : "")
        << "  if(NOT CMAKE_GENERATOR MATCHES \"Ninja\")\n"
        // Bare /MP means "one compile per core", which is exactly the
        // oversubscription that exhausts memory on these units.
@@ -5649,19 +5626,21 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << "  set_source_files_properties(${RECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "
           "\"${_recomp_msvc_opts}\")\n"
        << "else()\n"
-       // Overridable: -O1 suits a hybrid image, where the SIMD-heavy blocks stay
-       // on the JIT anyway, but a JIT-free image owns those blocks and GCC does
-       // not vectorise at all below -O2.
-       << "  set(RECOMP_OPT_FLAGS \"-O1 -foptimize-sibling-calls\" CACHE STRING\n"
+       // Overridable. -O2 by default: it measured ~11% faster than -O1 on arm64
+       // macOS, and GCC does not vectorise at all below -O2. The cache entry is
+       // versioned: a tree configured before the -O2 default keeps its cached -O1
+       // under the old name, and would otherwise never pick up the new default.
+       << "  set(RECOMP_OPT_FLAGS_V2 \"-O2 -foptimize-sibling-calls\" CACHE STRING\n"
           "      \"optimisation flags for the generated block bodies\")\n"
-       << "  separate_arguments(_recomp_opt NATIVE_COMMAND \"${RECOMP_OPT_FLAGS}\")\n"
+       << "  separate_arguments(_recomp_opt NATIVE_COMMAND \"${RECOMP_OPT_FLAGS_V2}\")\n"
        // Same reasoning as /WX- above: a host tree built with -Werror must not
        // fail on a shadowed local inside generated code.
        << "  list(APPEND _recomp_opt \"-Wno-error\")\n"
+       << (g_emit_fpx ? "  list(APPEND _recomp_opt \"-ffp-contract=off\" \"-fno-fast-math\")\n" : "")
        << "  set_source_files_properties(${RECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "
           "\"${_recomp_opt}\")\n"
        << "endif()\n\n"
-       << "if(NOT RECOMP_STATIC_ONLY)\n"
+       << (g_emit_standalone_runner ? "if(NOT RECOMP_STATIC_ONLY)\n" : "if(FALSE)\n")
        << "add_executable(recompiled main.c recomp_runtime.c ${RECOMP_SOURCES})\n"
        << "if(RECOMP_JOB_POOL)\n"
        << "  set_target_properties(recompiled PROPERTIES JOB_POOL_COMPILE ${RECOMP_JOB_POOL})\n"
@@ -5737,8 +5716,21 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
        << " g_module_base=g_module_base_" << mod
        << " g_recomp_guard_host_v2=g_recomp_guard_host_v2_" << mod
        << " recomp_image_abi=recomp_image_abi_" << mod
-       << " recomp_image_guard_v2=recomp_image_guard_v2_" << mod
-       << " recomp_lookup=recomp_lookup_" << mod
+       << " recomp_image_guard_v2=recomp_image_guard_v2_" << mod;
+    if (g_emit_fastmem) {
+        cm << " recomp_image_features=recomp_image_features_" << mod
+           << " recomp_image_fastmem_v1=recomp_image_fastmem_v1_" << mod;
+    } else if (g_emit_fpx) {
+        cm << " recomp_image_features=recomp_image_features_" << mod;
+    }
+    if (g_emit_fpx) {
+        cm << " recomp_image_fpx_v1=recomp_image_fpx_v1_" << mod;
+    }
+    if (EmitGuardGen()) {
+        cm << " g_recomp_gg_word=g_recomp_gg_word_" << mod
+           << " recomp_image_guard_gen_v1=recomp_image_guard_gen_v1_" << mod;
+    }
+    cm << " recomp_lookup=recomp_lookup_" << mod
        << " recomp_build_index=recomp_build_index_" << mod
        << " _recomp_index_view=_recomp_index_view_" << mod
        << " recomp_image_index=recomp_image_index_" << mod
@@ -5769,11 +5761,74 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
           "#endif\n\n"
           "/* Version of the generated-image contract used by automatic bundle\n"
           "   selection. ABI 4 adds bounded, nonrecursive module-local slices to\n"
-          "   guarded instruction side entries. */\n"
-          "RECOMP_API unsigned recomp_image_abi(void){ return 4; }\n"
+          "   guarded instruction side entries. ABI 5 restores per-entry checks\n"
+          "   and exact guest floating-point status. */\n"
+          "RECOMP_API unsigned recomp_image_abi(void){ return RECOMP_IMAGE_ABI; }\n"
           "RECOMP_API unsigned recomp_image_guard_v2(unsigned host_version){\n"
-          "  g_recomp_guard_host_v2=(host_version==2)?2:0; return 2;\n}\n"
-          "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
+          "  g_recomp_guard_host_v2=(host_version==2)?2:0; return 2;\n}\n";
+    if (EmitGuardGen()) {
+        u64 code_lo = 0, code_end = 0;
+        if (!blocks.empty()) {
+            code_lo = blocks.front().vaddr;
+            for (const auto& b : blocks) {
+                code_end = std::max<u64>(code_end, b.vaddr + (u64)b.count * 4);
+            }
+        }
+        char span[160];
+        snprintf(span, sizeof span,
+                 "  *code_lo=0x%llxULL; *code_end=0x%llxULL; *base=&g_module_base;\n",
+                 (unsigned long long)code_lo, (unsigned long long)code_end);
+        ex << "/* ABI 6 feature GG1. The generation word starts at VERIFY_ALWAYS, so\n"
+              "   until a host that knows GG1 takes it over every block verifies on\n"
+              "   every entry. The host passes its GG1 version and learns the word,\n"
+              "   the module-relative span the blocks cover, and where the load base\n"
+              "   lives. The FM1 handshake below refuses to complete before this one,\n"
+              "   so a host that knows FM1 but not GG1 refuses the whole bundle. */\n"
+              "uint32_t g_recomp_gg_word = RECOMP_GG_VERIFY_ALWAYS;\n"
+              "static int g_recomp_gg_host = 0;\n"
+              "RECOMP_API uint32_t* recomp_image_guard_gen_v1(uint32_t host_version, uint64_t* code_lo,\n"
+              "                                               uint64_t* code_end, const uint64_t** base){\n"
+              "  if(host_version!=2u) return 0;\n"
+              "  RECOMP_GG_STORE_RELEASE(g_recomp_gg_word,RECOMP_GG_VERIFY_ALWAYS);\n"
+           << span
+           << "  g_recomp_gg_host=1;\n"
+              "  return &g_recomp_gg_word;\n"
+              "}\n";
+    }
+    if (g_emit_fastmem) {
+        ex << "/* ABI 6 feature handshake. The host passes its own view of the page\n"
+              "   table layout and of the context offsets; 1 means this image was\n"
+              "   compiled against exactly those, so the host may enable fm_limit. */\n"
+              "RECOMP_API unsigned recomp_image_features(void){ return RECOMP_FEATURE_FASTMEM_PT1"
+           << (EmitGuardGen() ? " | RECOMP_FEATURE_GUARD_GEN1" : "")
+           << (g_emit_fpx ? " | RECOMP_FEATURE_FPX1" : "") << "; }\n"
+              "RECOMP_API unsigned recomp_image_fastmem_v1(uint32_t page_bits, uint32_t stride_log2,\n"
+              "                                            uint64_t ptr_mask, uint32_t off_table,\n"
+              "                                            uint32_t off_limit){\n"
+           << (EmitGuardGen() ? "  if(!g_recomp_gg_host) return 0;\n" : "")
+           << "  return page_bits==RECOMP_FM_PAGE_BITS && stride_log2==RECOMP_FM_STRIDE_LOG2 &&\n"
+              "         ptr_mask==(uint64_t)RECOMP_FM_PTR_MASK &&\n"
+              "         off_table==offsetof(GuestContext,fm_table) &&\n"
+              "         off_limit==offsetof(GuestContext,fm_limit);\n"
+              "}\n";
+    } else if (g_emit_fpx) {
+        ex << "/* ABI 6 feature report. */\n"
+              "RECOMP_API unsigned recomp_image_features(void){ return RECOMP_FEATURE_FPX1; }\n";
+    }
+    if (g_emit_fpx) {
+        ex << "/* FPX1 handshake. The host passes its own view of the FP control and\n"
+              "   status fields and of its kill-switch bit; nonzero means this image was\n"
+              "   compiled against exactly those. The low byte is RECOMP_FPX_HOST, the\n"
+              "   fast path this image was compiled to (0: compiled out). */\n"
+              "RECOMP_API unsigned recomp_image_fpx_v1(uint32_t off_fpcr, uint32_t off_fpsr,\n"
+              "                                        uint64_t inhibit_bit){\n"
+              "  if(off_fpcr!=offsetof(GuestContext,fpcr) || off_fpsr!=offsetof(GuestContext,fpsr) ||\n"
+              "     inhibit_bit!=RECOMP_FPX_INHIBIT) return 0;\n"
+              "  return 0x100u | (unsigned)RECOMP_FPX_HOST"
+           << (g_emit_fpx_shadow ? " | 0x200u; /* the shadow instrumentation build */\n" : ";\n")
+           << "}\n";
+    }
+    ex << "RECOMP_API BlockFn recomp_image_lookup(uint64_t pc){ return recomp_lookup(pc - g_module_base); }\n\n"
           "/* Run a bounded sequence while control flow stays inside this module.\n"
           "   Compact conditional branches return to this C loop instead of the\n"
           "   cross-library host dispatcher. Every additional block consumes the\n"
@@ -5821,14 +5876,23 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
     // The dispatch table is generated code like the block bodies, so it belongs
     // with them rather than at the top level.
     write("src/recompiled_" + mod + ".c", rc);
-    // The unit files were streamed out as blocks were translated; just make
-    // sure everything has reached disk.
-    for (auto& u : units) {
-        u.flush();
-        u.close();
+    // finish_unit closed each block translation unit before reaching here.
+    if (g_emit_standalone_runner) {
+        write("main.c", mc.str());
     }
-    write("main.c", mc.str());
-    write("recomp_export.c", ex.str());
+    std::string export_text = ex.str();
+    if (EmitGuardGen()) {
+        // A module moved to another base must be re-verified there: drop back
+        // to VERIFY_ALWAYS until the host moves the generation again.
+        static constexpr std::string_view set_base =
+            "RECOMP_API void recomp_image_set_base(uint64_t base){ g_module_base = base;\n";
+        export_text.replace(export_text.find(set_base), set_base.size(),
+                            "RECOMP_API void recomp_image_set_base(uint64_t base){\n"
+                            "  if(base!=g_module_base) RECOMP_GG_STORE_RELEASE(g_recomp_gg_word,"
+                            "RECOMP_GG_VERIFY_ALWAYS);\n"
+                            "  g_module_base = base;\n");
+    }
+    write("recomp_export.c", export_text);
     write("CMakeLists.txt", cm.str());
 
     // Coverage report. Without this the exporter cannot describe its own output:
@@ -5889,8 +5953,9 @@ inline RecompileStats EmitProject(const std::string& mod, const u8* text, size_t
         write("recomp_coverage.json", cov.str());
     }
 
-    // Bundle text/rodata/data as binary blobs so the exe can load them at startup
-    {
+    // Bundle text/rodata/data as binary blobs so the exe can load them at startup.
+    // Only for the standalone runner: nothing else reads them.
+    if (g_emit_standalone_runner) {
         std::string data_subdir = out_dir + "/data";
         make_dir(data_subdir);
         // Always write text.bin
@@ -6007,8 +6072,647 @@ RECOMP_INLINE unsigned recomp_fp_sticky(const uint64_t* p, unsigned count, int c
 )FS";
 }
 
-inline const char* RuntimeH() {
-    static const std::string text = std::string(R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
+// Scalar fixed-point helpers, returned as C for the generated runtime.
+// This implements the S/D, W/X non-trapping FPCR/FPSR contract used by the
+// existing runtime; FP16 and alternative-FP extensions are not added here.
+inline const char* FPFixedHelpers() {
+    return R"FX(
+/* Convert a binary32/64 significand directly to signed/unsigned fixed-point.
+   Round toward zero first, then saturate. IOC takes precedence over IXC. */
+static RECOMP_INLINE uint64_t recomp_fp_to_fixed(uint64_t bits, unsigned fp_bits,
+    unsigned int_bits, unsigned fbits, unsigned is_signed,
+    uint64_t fpcr, uint64_t* fpsr) {
+    const unsigned fraction_bits = fp_bits == 64 ? 52u : 23u;
+    const unsigned bias = fp_bits == 64 ? 1023u : 127u;
+    const uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const uint64_t exponent_mask = fp_bits == 64 ? 2047u : 255u;
+    const unsigned negative = (unsigned)((bits >> (fp_bits - 1)) & 1);
+    const unsigned exponent = (unsigned)((bits >> fraction_bits) & exponent_mask);
+    uint64_t mantissa = bits & fraction_mask;
+    const uint64_t integer_mask = int_bits == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    const uint64_t sign_bit = UINT64_C(1) << (int_bits - 1);
+    const uint64_t limit = is_signed ? sign_bit - (negative ? 0u : 1u) : integer_mask;
+    const uint64_t saturated = negative ? (is_signed ? sign_bit : 0) : limit;
+    uint64_t magnitude = 0;
+    unsigned inexact = 0, invalid = 0;
+    int shift;
+    if (exponent == exponent_mask) {
+        *fpsr |= UINT64_C(1); /* NaNs and infinities: invalid operation. */
+        return mantissa ? 0 : saturated;
+    }
+    if (exponent == 0) {
+        if (!mantissa) return 0; /* Both signed zeros. */
+        if (fpcr & (UINT64_C(1) << 24)) {
+            *fpsr |= UINT64_C(128); /* FZ: input-denormal, not inexact. */
+            return 0;
+        }
+    } else {
+        mantissa |= UINT64_C(1) << fraction_bits;
+    }
+    shift = (int)(exponent ? exponent : 1u) - (int)bias -
+            (int)fraction_bits + (int)fbits;
+    if (shift >= 0) {
+        if (shift >= 64 || mantissa > (limit >> (unsigned)shift)) invalid = 1;
+        else magnitude = mantissa << (unsigned)shift;
+    } else {
+        const unsigned discarded = (unsigned)(-shift);
+        if (discarded >= 64) {
+            inexact = mantissa != 0;
+        } else {
+            magnitude = mantissa >> discarded;
+            inexact = (mantissa & ((UINT64_C(1) << discarded) - 1)) != 0;
+        }
+        if (magnitude > limit) invalid = 1;
+    }
+    if (negative && !is_signed && magnitude != 0) invalid = 1;
+    if (invalid) {
+        *fpsr |= UINT64_C(1);
+        return saturated;
+    }
+    if (inexact) *fpsr |= UINT64_C(16);
+    return (negative ? UINT64_C(0) - magnitude : magnitude) & integer_mask;
+}
+
+/* Convert a binary32/64 value to a signed/unsigned integer in the given
+   rounding mode (0 nearest-even, 1 toward +inf, 2 toward -inf, 3 toward zero,
+   4 nearest-away), as FCVT{N,P,M,Z,A}{S,U}: round, then saturate. IOC takes
+   precedence over IXC; FZ flushes a subnormal input to zero with IDC. */
+static RECOMP_INLINE uint64_t recomp_fp_to_int(uint64_t bits, unsigned fp_bits,
+    unsigned int_bits, unsigned is_signed, unsigned rmode,
+    uint64_t fpcr, uint64_t* fpsr) {
+    const unsigned fraction_bits = fp_bits == 64 ? 52u : 23u;
+    const unsigned bias = fp_bits == 64 ? 1023u : 127u;
+    const uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const uint64_t exponent_mask = fp_bits == 64 ? 2047u : 255u;
+    const unsigned negative = (unsigned)((bits >> (fp_bits - 1)) & 1);
+    const unsigned exponent = (unsigned)((bits >> fraction_bits) & exponent_mask);
+    uint64_t mantissa = bits & fraction_mask;
+    const uint64_t integer_mask = int_bits == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    const uint64_t sign_bit = UINT64_C(1) << (int_bits - 1);
+    const uint64_t limit = is_signed ? sign_bit - (negative ? 0u : 1u) : integer_mask;
+    const uint64_t saturated = negative ? (is_signed ? sign_bit : 0) : limit;
+    uint64_t magnitude = 0;
+    unsigned inexact = 0, invalid = 0;
+    int shift;
+    if (exponent == exponent_mask) {
+        *fpsr |= UINT64_C(1); /* NaNs and infinities: invalid operation. */
+        return mantissa ? 0 : saturated;
+    }
+    if (exponent == 0) {
+        if (!mantissa) return 0; /* Both signed zeros. */
+        if (fpcr & (UINT64_C(1) << 24)) {
+            *fpsr |= UINT64_C(128); /* FZ: input-denormal, not inexact. */
+            return 0;
+        }
+    } else {
+        mantissa |= UINT64_C(1) << fraction_bits;
+    }
+    shift = (int)(exponent ? exponent : 1u) - (int)bias - (int)fraction_bits;
+    if (shift >= 0) {
+        if (shift >= 64 || mantissa > (limit >> (unsigned)shift)) invalid = 1;
+        else magnitude = mantissa << (unsigned)shift;
+    } else {
+        const unsigned discarded = (unsigned)(-shift);
+        uint64_t remainder = mantissa, half = 0; /* half 0: below one half */
+        if (discarded < 64) {
+            magnitude = mantissa >> discarded;
+            remainder = mantissa & ((UINT64_C(1) << discarded) - 1);
+            half = UINT64_C(1) << (discarded - 1);
+        }
+        inexact = remainder != 0;
+        if (inexact &&
+            ((rmode == 0 && half && (remainder > half || (remainder == half && (magnitude & 1)))) ||
+             (rmode == 4 && half && remainder >= half) || (rmode == 1 && !negative) ||
+             (rmode == 2 && negative))) {
+            ++magnitude;
+        }
+        if (magnitude > limit) invalid = 1;
+    }
+    if (negative && !is_signed && magnitude != 0) invalid = 1;
+    if (invalid) {
+        *fpsr |= UINT64_C(1);
+        return saturated;
+    }
+    if (inexact) *fpsr |= UINT64_C(16);
+    return (negative ? UINT64_C(0) - magnitude : magnitude) & integer_mask;
+}
+
+/* Convert the integer magnitude once, using the guest FPCR rounding mode.
+   All legal S/D fixed-point inputs produce zero or a finite normal result:
+   exponent range is at least -64 and at most 63. No host FP cast is used. */
+static RECOMP_INLINE uint64_t recomp_fixed_to_fp(uint64_t bits, unsigned fp_bits,
+    unsigned int_bits, unsigned fbits, unsigned is_signed,
+    uint64_t fpcr, uint64_t* fpsr) {
+    const unsigned fraction_bits = fp_bits == 64 ? 52u : 23u;
+    const unsigned bias = fp_bits == 64 ? 1023u : 127u;
+    const uint64_t integer_mask = int_bits == 64 ? UINT64_MAX : UINT64_C(0xffffffff);
+    const uint64_t fraction_mask = (UINT64_C(1) << fraction_bits) - 1;
+    const unsigned negative = is_signed && ((bits >> (int_bits - 1)) & 1);
+    uint64_t magnitude, mantissa;
+    unsigned top;
+    int exponent;
+    bits &= integer_mask;
+    magnitude = negative ? (UINT64_C(0) - bits) & integer_mask : bits;
+    if (!magnitude) return 0;
+    top = recomp_bit_index64(magnitude);
+    exponent = (int)top - (int)fbits;
+    if (top <= fraction_bits) {
+        mantissa = magnitude << (fraction_bits - top);
+    } else {
+        const unsigned discarded = top - fraction_bits; /* 1..40 for S/D. */
+        const uint64_t remainder = magnitude & ((UINT64_C(1) << discarded) - 1);
+        const uint64_t halfway = UINT64_C(1) << (discarded - 1);
+        const unsigned mode = (unsigned)((fpcr >> 22) & 3);
+        mantissa = magnitude >> discarded;
+        if (remainder) {
+            *fpsr |= UINT64_C(16);
+            if ((mode == 0 && (remainder > halfway ||
+                              (remainder == halfway && (mantissa & 1)))) ||
+                (mode == 1 && !negative) || (mode == 2 && negative)) {
+                ++mantissa;
+            }
+        }
+        if (mantissa >= (UINT64_C(1) << (fraction_bits + 1))) {
+            mantissa >>= 1;
+            ++exponent;
+        }
+    }
+    return ((uint64_t)negative << (fp_bits - 1)) |
+           ((uint64_t)(exponent + (int)bias) << fraction_bits) |
+           (mantissa & fraction_mask);
+}
+)FX";
+}
+
+// ABI 6 (FM1) header pieces. Each is empty in the ABI 5 text.
+inline const char* FastmemAbiH() {
+    return R"RT(6
+/* ABI 6 adds FM1, direct guest memory access through the host page table.
+   The memory helpers read Common::PageTable's entry array themselves, with its
+   layout folded in as the constants below, and serve an access only when it
+   lies inside one page whose entry holds a real backing pointer. Anything else
+   goes to the unchanged ABI 5 helper. The host enables this per context through
+   fm_table/fm_limit, and only after recomp_image_fastmem_v1 has confirmed these
+   constants and the field offsets for every loaded module. */
+#define RECOMP_FEATURE_FASTMEM_PT1 1u
+#define RECOMP_FM_PAGE_BITS 12
+#define RECOMP_FM_STRIDE_LOG2 5
+#define RECOMP_FM_PTR_MASK (~(uintptr_t)3)
+#if defined(_MSC_VER) && !defined(__clang__)
+#define RECOMP_NOINLINE __declspec(noinline)
+#define RECOMP_LIKELY(x) (x)
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_NOINLINE __attribute__((noinline))
+#define RECOMP_LIKELY(x) __builtin_expect(!!(x), 1)
+#else
+#define RECOMP_NOINLINE
+#define RECOMP_LIKELY(x) (x)
+#endif
+)RT";
+}
+
+inline const char* FastmemContextFieldsH() {
+    return R"RT(    /* ABI 6 (FM1). Written only by the host thread that owns this context,
+       before it enters generated code. fm_limit 0 turns the fast path off.
+       Otherwise fm_table is host_mem->page_entries, and fm_limit is page
+       aligned, at most 2^39, and no higher than host_mem->address_space_max. */
+    uint32_t fm_reserved;
+    const unsigned char* fm_table;
+    uint64_t fm_limit;
+)RT";
+}
+
+inline const char* FastmemLayoutPinsH() {
+    return R"RT(typedef char recomp_layout_fm_table[offsetof(GuestContext, fm_table) == 872 ? 1 : -1];
+typedef char recomp_layout_fm_limit[offsetof(GuestContext, fm_limit) == 880 ? 1 : -1];
+)RT";
+}
+
+// ABI 6 feature GG1 (generation code guard). Declared after recomp_code_guard.
+inline const char* GuardGenH() {
+    return R"RT(/* ABI 6 feature GG1: the generation code guard.
+   A block runs the full recomp_code_guard only when its seen word differs from
+   its module's generation word, then records the generation it verified
+   against. The host moves the generation after every event that can change a
+   guarded instruction word or its mapping, and holds it at
+   RECOMP_GG_VERIFY_ALWAYS for anything it cannot prove stable; that value is
+   never stored as a seen word, and seen words start at 0, which the host never
+   uses, so an unnegotiated module verifies on every entry exactly as ABI 5.
+   Ordering: the host stores the word with release; blocks load both words
+   relaxed; recomp_code_guard_gen fences with acquire before reading code and
+   publishes the seen word with release after the check has passed. */
+#define RECOMP_FEATURE_GUARD_GEN1 2u
+#define RECOMP_GG_VERIFY_ALWAYS 0xFFFFFFFFu
+/* Byte offset of the watch word in a host page-table entry. Nonzero marks a
+   code page the host keeps stable; stores to it must go to the host. */
+#define RECOMP_GG_WATCH_OFFSET 24
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define RECOMP_GG_LOAD(x) (*(const volatile uint32_t*)&(x))
+#if defined(_M_ARM64)
+#define RECOMP_GG_ACQUIRE_FENCE() __dmb(_ARM64_BARRIER_ISHLD)
+#define RECOMP_GG_STORE_RELEASE(x,v) __stlr32((volatile unsigned __int32*)&(x),(unsigned __int32)(v))
+#else
+#define RECOMP_GG_ACQUIRE_FENCE() _ReadWriteBarrier()
+#define RECOMP_GG_STORE_RELEASE(x,v) do{ _ReadWriteBarrier(); *(volatile uint32_t*)&(x)=(v); }while(0)
+#endif
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_GG_LOAD(x) __atomic_load_n(&(x),__ATOMIC_RELAXED)
+#define RECOMP_GG_ACQUIRE_FENCE() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#define RECOMP_GG_STORE_RELEASE(x,v) __atomic_store_n(&(x),(v),__ATOMIC_RELEASE)
+#else
+#error "GG1 needs 32-bit atomic loads, stores and fences"
+#endif
+/* Hidden where that exists: the word is only ever reached from inside its own
+   image (the host gets its address from the handshake), so blocks address it
+   directly instead of through the GOT. Not __attribute__((cold)) on the miss
+   path: Apple clang then splits a cold fragment out of every block, one
+   symbol and unwind entry each; an unlikely branch keeps the call at the end
+   of the block instead. */
+#if defined(__GNUC__) || defined(__clang__)
+#define RECOMP_GG_STATIC static inline
+#define RECOMP_GG_UNLIKELY(x) __builtin_expect(!!(x),0)
+#if defined(_WIN32)
+#define RECOMP_GG_HIDDEN
+#else
+#define RECOMP_GG_HIDDEN __attribute__((visibility("hidden")))
+#endif
+#else
+#define RECOMP_GG_STATIC static __inline
+#define RECOMP_GG_UNLIKELY(x) (x)
+#define RECOMP_GG_HIDDEN
+#endif
+extern uint32_t g_recomp_gg_word RECOMP_GG_HIDDEN;
+void recomp_code_guard_gen(GuestContext*,uint64_t,const uint32_t*,uint32_t,int,uint32_t*,uint32_t);
+/* Each unit keeps its blocks' seen words in its own zero-initialised static
+   array, recomp_gg_seen (no file size), so a block reaches its slot at a
+   link-time constant address. Each block's expected words are preceded by a
+   three-word header: word count, then the module-relative PC, low and high.
+   The miss path is one private copy per unit with three register arguments.
+   The generation is loaded there, before recomp_code_guard_gen's acquire
+   fence; a value newer than the one the block compared is equally valid to
+   record. */
+RECOMP_GG_STATIC RECOMP_NOINLINE void recomp_gg_miss(GuestContext* c,uint32_t* seen,const uint32_t* h){
+  recomp_code_guard_gen(c,g_module_base+((uint64_t)h[1]|((uint64_t)h[2]<<32)),h+3,h[0],
+                        g_recomp_guard_host_v2,seen,RECOMP_GG_LOAD(g_recomp_gg_word));
+}
+#define RECOMP_GG_GUARD(hdr,idx) \
+  if(RECOMP_GG_UNLIKELY(RECOMP_GG_LOAD(recomp_gg_seen[idx])!=RECOMP_GG_LOAD(g_recomp_gg_word))) \
+    recomp_gg_miss(c,&recomp_gg_seen[idx],hdr);
+)RT";
+}
+
+// ABI 6 feature FPX1 pieces of the runtime header. Empty unless the option is on.
+// Kept under MSVC's 16380-byte limit per string literal.
+inline const char* FpxAbiH() {
+    return R"RT(6
+/* ABI 6 without FM1 carries only FPX1 below. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define RECOMP_NOINLINE __declspec(noinline)
+#define RECOMP_LIKELY(x) (x)
+#elif defined(__GNUC__) || defined(__clang__)
+#define RECOMP_NOINLINE __attribute__((noinline))
+#define RECOMP_LIKELY(x) __builtin_expect(!!(x), 1)
+#else
+#define RECOMP_NOINLINE
+#define RECOMP_LIKELY(x) (x)
+#endif
+)RT";
+}
+
+inline const char* FpxH() {
+    return R"RT(
+/* ABI 6 feature FPX1: exact native floating point.
+
+   A covered op (FADD/FSUB/FMUL/FNMUL/FDIV/FMLA-family/FRECPS/FRSQRTS/FSQRT,
+   S and D, scalar and per lane) first computes natively, and keeps that result
+   only when it provably equals the architectural one and adds no FPSR bit:
+   - the gate RECOMP_FPX_OPEN: guest FPCR at its default (RMode RN, no FZ, DN,
+     AHP or FZ16, no trap enables, no FEAT_AFP bits) and FPSR.IXC already set;
+   - the result is finite and larger in magnitude than the smallest normal, so
+     it is neither NaN (IOC), infinite (DZC, OFC) nor tiny (UFC), and IDC needs
+     FZ; or it is exact: any finite sum, or a finite product or quotient of a
+     zero. What is left is IXC, which is already set.
+   IEEE add, subtract, multiply, divide, square root and fused multiply-add are
+   correctly rounded, so under the host FP mode below every such result equals
+   the ARM result bit for bit. Anything else takes the unchanged exact body.
+
+   Host contract, enforced by the host once it has negotiated FPX1 through
+   recomp_image_fpx_v1: on x86-64 MXCSR round-to-nearest with DAZ and FTZ clear
+   and every exception masked; on AArch64 FPCR 0. Bit 32 of fpcr is the host's
+   kill switch (RECOMP_FPX_INHIBIT): the guest register is 32 bits, so MRS/MSR
+   never expose or clear it, and with it set every op takes the exact body.
+
+   x86-64 has no FMA in its baseline, so a single-precision FMA is computed in
+   binary64: the product of two binary32 values is exact there, one rounding
+   follows, and rounding that again to binary32 equals rounding the exact value
+   once unless the binary64 value is itself a binary32 midpoint, which falls
+   back (RECOMP_FPX_MIDPOINT). Because the product is exact, contracting the
+   expression gives the same value. Double-precision FMA needs a hardware FMA
+   (__FMA__); without one it stays exact-body only. */
+#include <float.h>
+#define RECOMP_FEATURE_FPX1 4u
+#define RECOMP_FPX_INHIBIT (UINT64_C(1) << 32)
+#define RECOMP_FPX_FPCR_MASK (UINT64_C(0x07C8FF07) | RECOMP_FPX_INHIBIT)
+#if defined(RECOMP_NO_NATIVE_FP) || defined(__FAST_MATH__) || defined(_M_FP_FAST) || \
+    (defined(FLT_EVAL_METHOD) && FLT_EVAL_METHOD != 0)
+#define RECOMP_FPX_HOST 0 /* compiled out: every op takes the exact body */
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+#define RECOMP_FPX_HOST 1 /* the host FPU is the guest's */
+#elif (defined(__x86_64__) || defined(_M_X64)) && !defined(_M_ARM64EC)
+#define RECOMP_FPX_HOST 2 /* SSE2 */
+#include <emmintrin.h>
+#else
+#define RECOMP_FPX_HOST 0
+#endif
+#if RECOMP_FPX_HOST == 1 || \
+    (RECOMP_FPX_HOST == 2 && defined(__FMA__) && (defined(__GNUC__) || defined(__clang__)))
+#define RECOMP_FPX_FMA64 1 /* a correctly rounded binary64 FMA instruction */
+#else
+#define RECOMP_FPX_FMA64 0
+#endif
+#ifndef RECOMP_FPX_PROBE
+#define RECOMP_FPX_PROBE(k) ((void)0) /* test and shadow builds count here */
+#endif
+#define RECOMP_FPX_OPEN(c) (((c)->fpsr & 16u) && !((c)->fpcr & RECOMP_FPX_FPCR_MASK))
+#define RECOMP_FPX_FIN32(t) (((t) & 0x7f800000u) != 0x7f800000u)
+#define RECOMP_FPX_BIG32(t) ((uint32_t)(((t) & 0x7fffffffu) - 0x00800001u) < 0x7effffffu)
+#define RECOMP_FPX_ZERO32(x) (((x) & 0x7fffffffu) == 0)
+#define RECOMP_FPX_FIN64(t) (((t) & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000))
+#define RECOMP_FPX_BIG64(t) \
+    (((t) & UINT64_C(0x7fffffffffffffff)) - UINT64_C(0x0010000000000001) < UINT64_C(0x7fdfffffffffffff))
+#define RECOMP_FPX_ZERO64(x) (((x) & UINT64_C(0x7fffffffffffffff)) == 0)
+/* Products: large, or a finite product of a zero (exact, the zero's sign rule
+   is IEEE's on both). Quotients: large, or a finite quotient of a zero. */
+#define RECOMP_FPX_KEEP32(t, a, b) \
+    (RECOMP_FPX_BIG32(t) || ((RECOMP_FPX_ZERO32(a) || RECOMP_FPX_ZERO32(b)) && RECOMP_FPX_FIN32(t)))
+#define RECOMP_FPX_KEEP64(t, a, b) \
+    (RECOMP_FPX_BIG64(t) || ((RECOMP_FPX_ZERO64(a) || RECOMP_FPX_ZERO64(b)) && RECOMP_FPX_FIN64(t)))
+#define RECOMP_FPX_KEEPDIV32(t, a) (RECOMP_FPX_BIG32(t) || (RECOMP_FPX_ZERO32(a) && RECOMP_FPX_FIN32(t)))
+#define RECOMP_FPX_KEEPDIV64(t, a) (RECOMP_FPX_BIG64(t) || (RECOMP_FPX_ZERO64(a) && RECOMP_FPX_FIN64(t)))
+/* A binary64 value in the binary32 normal range that lies exactly halfway
+   between two binary32 values. */
+#define RECOMP_FPX_MIDPOINT(s) ((recomp_fpx_db(s) & UINT64_C(0x1fffffff)) == UINT64_C(0x10000000))
+
+static RECOMP_INLINE float recomp_fpx_f(uint64_t x) { uint32_t t = (uint32_t)x; float f; memcpy(&f, &t, 4); return f; }
+static RECOMP_INLINE uint64_t recomp_fpx_fb(float f) { uint32_t t; memcpy(&t, &f, 4); return t; }
+static RECOMP_INLINE double recomp_fpx_d(uint64_t x) { double f; memcpy(&f, &x, 8); return f; }
+static RECOMP_INLINE uint64_t recomp_fpx_db(double f) { uint64_t t; memcpy(&t, &f, 8); return t; }
+
+/* Each returns 1 and the result bits in *v when the native result may be kept. */
+static RECOMP_INLINE int recomp_fpx_add32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) + recomp_fpx_f(b));
+    if (RECOMP_FPX_FIN32(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_sub32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) - recomp_fpx_f(b));
+    if (RECOMP_FPX_FIN32(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_mul32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) * recomp_fpx_f(b));
+    if (RECOMP_FPX_KEEP32(t, a, b)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_div32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_fb(recomp_fpx_f(a) / recomp_fpx_f(b));
+    if (RECOMP_FPX_KEEPDIV32(t, a)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_fma32(uint64_t a, uint64_t b, uint64_t z, uint64_t* v) {
+#if RECOMP_FPX_HOST == 1
+    const uint64_t t = recomp_fpx_fb(__builtin_fmaf(recomp_fpx_f(a), recomp_fpx_f(b), recomp_fpx_f(z)));
+#elif RECOMP_FPX_HOST == 2
+    const double s = (double)recomp_fpx_f(a) * (double)recomp_fpx_f(b) + (double)recomp_fpx_f(z);
+    uint64_t t;
+    if (RECOMP_FPX_MIDPOINT(s)) return 0;
+    t = recomp_fpx_fb((float)s);
+#endif
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_KEEP32(t, a, b)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)z; (void)v; return 0;
+}
+/* FRECPS: 2 - a*b; FRSQRTS: (3 - a*b)/2, each rounded once. inf*0 gives NaN
+   here, which is never kept; the exact body returns 2.0 or 1.5. */
+static RECOMP_INLINE int recomp_fpx_recps32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST == 1
+    const uint64_t t = recomp_fpx_fb(__builtin_fmaf(-recomp_fpx_f(a), recomp_fpx_f(b), 2.0f));
+#elif RECOMP_FPX_HOST == 2
+    const double s = 2.0 - (double)recomp_fpx_f(a) * (double)recomp_fpx_f(b);
+    uint64_t t;
+    if (RECOMP_FPX_MIDPOINT(s)) return 0;
+    t = recomp_fpx_fb((float)s);
+#endif
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_BIG32(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_rsqrts32(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST == 1
+    /* Halving a normal result is exact, and a normal result is all that is kept. */
+    const uint64_t t = recomp_fpx_fb(__builtin_fmaf(-recomp_fpx_f(a), recomp_fpx_f(b), 3.0f) * 0.5f);
+#elif RECOMP_FPX_HOST == 2
+    const double s = (3.0 - (double)recomp_fpx_f(a) * (double)recomp_fpx_f(b)) * 0.5;
+    uint64_t t;
+    if (RECOMP_FPX_MIDPOINT(s)) return 0;
+    t = recomp_fpx_fb((float)s);
+#endif
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_BIG32(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+/* Square root of a positive finite input (subnormal included) is normal and
+   finite; of +-0 it is the input. Negative inputs, infinities and NaNs fall back. */
+static RECOMP_INLINE int recomp_fpx_sqrt32(uint64_t a, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_ZERO32(a)) { *v = a; return 1; }
+    if ((uint32_t)a - 1u >= 0x7f7fffffu) return 0;
+#if RECOMP_FPX_HOST == 1
+    *v = recomp_fpx_fb(__builtin_sqrtf(recomp_fpx_f(a)));
+#else
+    *v = recomp_fpx_fb(_mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(recomp_fpx_f(a)))));
+#endif
+    return 1;
+#else
+    (void)a; (void)v; return 0;
+#endif
+}
+)RT";
+}
+
+inline const char* FpxH64() {
+    return R"RT(
+static RECOMP_INLINE int recomp_fpx_add64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) + recomp_fpx_d(b));
+    if (RECOMP_FPX_FIN64(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_sub64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) - recomp_fpx_d(b));
+    if (RECOMP_FPX_FIN64(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_mul64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) * recomp_fpx_d(b));
+    if (RECOMP_FPX_KEEP64(t, a, b)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_div64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    const uint64_t t = recomp_fpx_db(recomp_fpx_d(a) / recomp_fpx_d(b));
+    if (RECOMP_FPX_KEEPDIV64(t, a)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_fma64(uint64_t a, uint64_t b, uint64_t z, uint64_t* v) {
+#if RECOMP_FPX_FMA64
+    const uint64_t t = recomp_fpx_db(__builtin_fma(recomp_fpx_d(a), recomp_fpx_d(b), recomp_fpx_d(z)));
+    if (RECOMP_FPX_KEEP64(t, a, b)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)z; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_recps64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_FMA64
+    const uint64_t t = recomp_fpx_db(__builtin_fma(-recomp_fpx_d(a), recomp_fpx_d(b), 2.0));
+    if (RECOMP_FPX_BIG64(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_rsqrts64(uint64_t a, uint64_t b, uint64_t* v) {
+#if RECOMP_FPX_FMA64
+    const uint64_t t = recomp_fpx_db(__builtin_fma(-recomp_fpx_d(a), recomp_fpx_d(b), 3.0) * 0.5);
+    if (RECOMP_FPX_BIG64(t)) { *v = t; return 1; }
+#endif
+    (void)a; (void)b; (void)v; return 0;
+}
+static RECOMP_INLINE int recomp_fpx_sqrt64(uint64_t a, uint64_t* v) {
+#if RECOMP_FPX_HOST
+    if (RECOMP_FPX_ZERO64(a)) { *v = a; return 1; }
+    if (a - 1u >= UINT64_C(0x7fefffffffffffff)) return 0;
+#if RECOMP_FPX_HOST == 1
+    *v = recomp_fpx_db(__builtin_sqrt(recomp_fpx_d(a)));
+#else
+    *v = recomp_fpx_db(_mm_cvtsd_f64(_mm_sqrt_sd(_mm_setzero_pd(), _mm_set_sd(recomp_fpx_d(a)))));
+#endif
+    return 1;
+#else
+    (void)a; (void)v; return 0;
+#endif
+}
+)RT";
+}
+
+// Instrumentation only (g_emit_fpx_shadow): the runtime half of the shadow
+// build. Per kind (op*2 + double) it counts calls, open gates, kept fast
+// results and mismatches against the exact body, which runs anyway; the first
+// 100 mismatches are logged with their operands. Counts are per thread and
+// folded into the totals every 2^20 calls; mismatches are counted at once.
+// SUYU_RECOMP_FPX_SHADOW_LOG names the log (stderr otherwise); the totals are
+// rewritten to it + ".sum" as they grow and at exit.
+inline const char* FpxShadowC() {
+    return R"RT(
+/* FPX1 shadow instrumentation (never timed). */
+#include <stdio.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define RECOMP_FPX_TLS __declspec(thread)
+#define RECOMP_FPX_ADD(p, v) _InterlockedExchangeAdd64((volatile long long*)(p), (long long)(v))
+#define RECOMP_FPX_OR(p, v) _InterlockedOr64((volatile long long*)(p), (long long)(v))
+#else
+#define RECOMP_FPX_TLS _Thread_local
+#define RECOMP_FPX_ADD(p, v) __atomic_fetch_add((p), (v), __ATOMIC_RELAXED)
+#define RECOMP_FPX_OR(p, v) __atomic_fetch_or((p), (v), __ATOMIC_RELAXED)
+#endif
+static uint64_t g_recomp_fpx_sh[16][4];     /* calls, gate open, kept, mismatches */
+static uint64_t g_recomp_fpx_sh_fpsr, g_recomp_fpx_sh_folds;
+static RECOMP_FPX_TLS uint64_t t_recomp_fpx_sh[16][3];
+static RECOMP_FPX_TLS uint64_t t_recomp_fpx_sh_n, t_recomp_fpx_sh_or;
+static void recomp_fpx_shadow_dump(void) {
+  static const char* const names[8] = {"add","sub","mul","div","fma","recps","rsqrts","sqrt"};
+  const char* path = getenv("SUYU_RECOMP_FPX_SHADOW_LOG");
+  char sum[1024];
+  FILE* f = stderr;
+  if (path && *path) {
+    snprintf(sum, sizeof sum, "%s.sum", path);
+    f = fopen(sum, "w");
+    if (!f) return;
+  }
+  fprintf(f, "kind calls gate_open kept mismatches\n");
+  for (unsigned k = 0; k < 16; ++k)
+    fprintf(f, "%s%u %llu %llu %llu %llu\n", names[k / 2], k & 1 ? 64u : 32u,
+            (unsigned long long)g_recomp_fpx_sh[k][0], (unsigned long long)g_recomp_fpx_sh[k][1],
+            (unsigned long long)g_recomp_fpx_sh[k][2], (unsigned long long)g_recomp_fpx_sh[k][3]);
+  fprintf(f, "fpsr_seen 0x%llx\n", (unsigned long long)g_recomp_fpx_sh_fpsr);
+  if (f != stderr) fclose(f);
+}
+static void recomp_fpx_shadow_fold_counts(void) {
+  for (unsigned k = 0; k < 16; ++k)
+    for (unsigned j = 0; j < 3; ++j) {
+      RECOMP_FPX_ADD(&g_recomp_fpx_sh[k][j], t_recomp_fpx_sh[k][j]);
+      t_recomp_fpx_sh[k][j] = 0;
+    }
+  RECOMP_FPX_OR(&g_recomp_fpx_sh_fpsr, t_recomp_fpx_sh_or);
+}
+/* At exit, on the exiting thread: its own unfolded counts, then the totals. */
+static void recomp_fpx_shadow_exit(void) {
+  recomp_fpx_shadow_fold_counts();
+  recomp_fpx_shadow_dump();
+}
+static void recomp_fpx_shadow_fold(void) {
+  static int registered;
+  recomp_fpx_shadow_fold_counts();
+  if (!registered) { registered = 1; atexit(recomp_fpx_shadow_exit); }
+  if ((RECOMP_FPX_ADD(&g_recomp_fpx_sh_folds, 1) & 63) == 0) recomp_fpx_shadow_dump();
+}
+void recomp_fpx_shadow(unsigned kind, int gate, int kept, uint64_t fast, uint64_t exact,
+                       uint64_t fpsr_before, uint64_t fpsr_after, uint64_t a, uint64_t b) {
+  kind &= 15;
+  ++t_recomp_fpx_sh[kind][0];
+  t_recomp_fpx_sh[kind][1] += gate != 0;
+  t_recomp_fpx_sh[kind][2] += kept != 0;
+  if (kept && (fast != exact || fpsr_before != fpsr_after)) {
+    const uint64_t n = RECOMP_FPX_ADD(&g_recomp_fpx_sh[kind][3], 1);
+    if (n < 100) {
+      const char* path = getenv("SUYU_RECOMP_FPX_SHADOW_LOG");
+      FILE* f = path && *path ? fopen(path, "a") : stderr;
+      if (f) {
+        fprintf(f, "MISMATCH kind=%u a=%016llx b=%016llx fast=%016llx exact=%016llx fpsr %llx->%llx\n",
+                kind, (unsigned long long)a, (unsigned long long)b, (unsigned long long)fast,
+                (unsigned long long)exact, (unsigned long long)fpsr_before,
+                (unsigned long long)fpsr_after);
+        if (f != stderr) fclose(f);
+      }
+    }
+    recomp_fpx_shadow_dump();
+  }
+  t_recomp_fpx_sh_or |= fpsr_after & 0x9f;
+  /* The first call registers the exit report; then every 2^20th folds. */
+  if (!(t_recomp_fpx_sh_n++ & 0xfffff)) recomp_fpx_shadow_fold();
+}
+)RT";
+}
+
+// `fpx`: 0 off, 1 FPX1, 2 FPX1 with the shadow instrumentation.
+inline std::string BuildRuntimeH(bool fastmem, bool guard_gen = false, int fpx = 0) {
+    std::string text = std::string(R"RT(#ifndef SUYU_RECOMP_RUNTIME_H
 #define SUYU_RECOMP_RUNTIME_H
 #include <stdint.h>
 #include <stddef.h>   /* offsetof, for the layout assertions below */
@@ -6032,9 +6736,11 @@ inline const char* RuntimeH() {
 #else
 #define RECOMP_INLINE inline
 #endif
-)RT") + FPScanHelpers() + R"RT(
+)RT") + FPScanHelpers() + FPFixedHelpers() + R"RT(
 /* Supplied by the host when the recompiled image is driven by an emulator
    rather than run standalone. `size` is 1, 2, 4 or 8 bytes. */
+#define RECOMP_IMAGE_ABI 5
+
 typedef struct RecompHostMem {
     void* user;
     uint64_t (*load)(void* user, uint64_t va, uint32_t size);
@@ -6080,19 +6786,8 @@ typedef struct RecompHostMem {
     uint64_t page_bits;
     uint64_t pointer_mask;
     uint64_t address_space_max;
-    /* Generation counter for the code guard, owned by the host and shared by
-       every core. The host bumps it whenever guest code may have changed: an
-       IC IVAU, a cache-range invalidation from another engine, a full icache
-       flush, or a new page table. A block re-verifies its bytes only when this
-       has moved since that block last checked, instead of on every entry.
-
-       A pointer rather than a value because each core owns its own
-       RecompHostMem, and one core invalidating code has to be seen by blocks
-       running on all of them.
-
-       Null is allowed and means "no host generation", which makes every block
-       verify exactly once - the standalone runtime's situation, where nothing
-       can remap or rewrite guest code behind the generated image. */
+    /* Reserved layout slot. ABI 5 verifies code on every entry and
+       never dereferences this pointer. Hosts must set it to null. */
     const uint64_t* guard_generation;
 } RecompHostMem;
 
@@ -6148,7 +6843,7 @@ typedef struct GuestContext {
        save_dir below lands 512 bytes further along on this side than on that
        one. The layout assertions below are what catch that. */
     int chain_budget;
-    /* Save-data filesystem state */
+)RT" + (fastmem ? FastmemContextFieldsH() : "") + R"RT(    /* Save-data filesystem state */
     char save_dir[512];
     /* Heap break for SVC memory allocation */
     uint64_t heap_base; uint64_t heap_end; uint64_t heap_cur;
@@ -6177,7 +6872,7 @@ typedef char recomp_layout_fpsr[offsetof(GuestContext, fpsr) == 856 ? 1 : -1];
 typedef char recomp_layout_host[offsetof(GuestContext, host_mem) == 832 ? 1 : -1];
 typedef char recomp_layout_chain[offsetof(GuestContext, chain_budget) == 864 ? 1 : -1];
 typedef char recomp_layout_tpidrro[offsetof(GuestContext, tpidrro_el0) == 840 ? 1 : -1];
-
+)RT" + (fastmem ? FastmemLayoutPinsH() : "") + R"RT(
 /* Where this module is actually loaded in the guest's address space.
    Every address the static pass bakes in - ADR/ADRP results, branch targets,
    return addresses - is relative to the module, because that is all it can
@@ -6253,7 +6948,43 @@ int  recomp_save_exists(GuestContext* c, const char* name);
 int  recomp_load_segments(GuestContext* c, const char* data_dir);
 #endif
 )RT";
-    return text.c_str();
+    if (fastmem || fpx) {
+        // The ABI line stays literal above; ABI 6 replaces it with its own block.
+        static constexpr std::string_view abi5_line = "#define RECOMP_IMAGE_ABI 5\n";
+        text.replace(text.find(abi5_line), abi5_line.size(),
+                     std::string("#define RECOMP_IMAGE_ABI ") + (fastmem ? FastmemAbiH() : FpxAbiH()));
+    }
+    if (fpx) {
+        // After GuestContext, before the include guard closes.
+        static constexpr std::string_view guard_end = "#endif\n";
+        const size_t at = text.rfind(guard_end);
+        text.insert(at, std::string(FpxH()) + FpxH64() +
+                            (fpx == 2 ? "/* FPX1 shadow instrumentation build (never timed). */\n"
+                                        "void recomp_fpx_shadow(unsigned kind, int gate, int kept, uint64_t fast,\n"
+                                        "    uint64_t exact, uint64_t fpsr_before, uint64_t fpsr_after,\n"
+                                        "    uint64_t a, uint64_t b);\n"
+                                      : ""));
+    }
+    if (fastmem && guard_gen) {
+        static constexpr std::string_view anchor = "void recomp_ic_ivau(GuestContext*,uint64_t,int);\n";
+        text.insert(text.find(anchor) + anchor.size(), GuardGenH());
+    }
+    return text;
+}
+
+// One cached text per variant: the first caller must not fix the variant for
+// the whole process.
+inline int FpxVariant() {
+    return g_emit_fpx ? (g_emit_fpx_shadow ? 2 : 1) : 0;
+}
+inline const char* RuntimeH() {
+    // [fastmem][guard_gen][fpx variant: 0 off, 1 FPX1, 2 FPX1+shadow].
+    static const std::string texts[2][2][3] = {
+        {{BuildRuntimeH(false, false, 0), BuildRuntimeH(false, false, 1), BuildRuntimeH(false, false, 2)},
+         {BuildRuntimeH(false, true, 0), BuildRuntimeH(false, true, 1), BuildRuntimeH(false, true, 2)}},
+        {{BuildRuntimeH(true, false, 0), BuildRuntimeH(true, false, 1), BuildRuntimeH(true, false, 2)},
+         {BuildRuntimeH(true, true, 0), BuildRuntimeH(true, true, 1), BuildRuntimeH(true, true, 2)}}};
+    return texts[g_emit_fastmem ? 1 : 0][EmitGuardGen() ? 1 : 0][FpxVariant()].c_str();
 }
 
 inline const char* EstimateRuntimeC() {
@@ -6312,12 +7043,200 @@ uint64_t recomp_fp_estimate(GuestContext* c,uint64_t bits,unsigned width,int rsq
 )EST";
 }
 
-inline const char* RuntimeC() {
+// ABI 6 (FM1) memory helpers. `abi5` is the ABI 5 helper text. It is kept
+// verbatim as the slow path, with only the twelve public helpers renamed to
+// recomp_*_slow (their calls to one another included) and made static and
+// noinline. Deriving it from the ABI 5 text rather than restating it means the
+// slow path cannot drift from what ABI 5 does.
+inline std::string FastmemHelpersC(std::string abi5, bool guard_gen = false) {
+    static constexpr const char* kHelpers[] = {
+        "load8",  "load16",  "load32", "load64", "store8", "store16",
+        "store32", "store64", "ldp64", "stp64",  "ldp32",  "stp32",
+    };
+    const auto replace_all = [&abi5](const std::string& from, const std::string& to) {
+        for (size_t at = abi5.find(from); at != std::string::npos;
+             at = abi5.find(from, at + to.size())) {
+            abi5.replace(at, from.size(), to);
+        }
+    };
+    for (const char* name : kHelpers) {
+        const std::string base = std::string("recomp_") + name;
+        replace_all(base + " (", base + "_slow(");
+        replace_all(base + "(", base + "_slow(");
+    }
+    replace_all("\nuint64_t recomp_", "\nstatic RECOMP_NOINLINE uint64_t recomp_");
+    replace_all("\nvoid recomp_", "\nstatic RECOMP_NOINLINE void recomp_");
+    std::string text = abi5 + R"RT(
+/* ABI 6 (FM1) fast path. One read of the same page-table entry the ABI 5 walk
+   would read, for exactly the accesses ABI 5 would serve from that entry:
+   in range, inside one page, and backed by a real pointer. It returns the
+   entry's pointer part (host page - guest page), or 0 to decline. Declining is
+   always safe, because the caller then runs the unchanged ABI 5 helper above.
+
+   fm_limit is page aligned, no higher than address_space_max and at most 2^39,
+   so one compare covers the disabled state (0), every bound ABI 5 checks, and
+   any tagged or out-of-range address, which ABI 5 then masks and serves as
+   before. Unmapped, debug and GPU-tracked pages have a null pointer part, so
+   they decline too and still reach the host callback, in the same order and
+   with the same arguments. */
+static RECOMP_INLINE uintptr_t recomp_fm_entry(const GuestContext* c, uint64_t va, unsigned bytes){
+  if(va >= c->fm_limit) return 0;
+  if((va & 0xfffu) > 0x1000u - bytes) return 0;
+  return *(const uintptr_t*)(c->fm_table + ((uintptr_t)(va >> RECOMP_FM_PAGE_BITS)
+                                            << RECOMP_FM_STRIDE_LOG2)) & RECOMP_FM_PTR_MASK;
+}
+#define RECOMP_FM_PTR(e,a) ((unsigned char*)((e) + (uintptr_t)(a)))
+
+uint64_t recomp_load8 (GuestContext* c,uint64_t a){
+  uintptr_t e=recomp_fm_entry(c,a,1);
+  if(RECOMP_LIKELY(e)) return (uint64_t)*RECOMP_FM_PTR(e,a);
+  return recomp_load8_slow(c,a);}
+uint64_t recomp_load16(GuestContext* c,uint64_t a){
+  uintptr_t e=recomp_fm_entry(c,a,2);
+  if(RECOMP_LIKELY(e)){uint16_t v;memcpy(&v,RECOMP_FM_PTR(e,a),2);return (uint64_t)v;}
+  return recomp_load16_slow(c,a);}
+uint64_t recomp_load32(GuestContext* c,uint64_t a){
+  uintptr_t e=recomp_fm_entry(c,a,4);
+  if(RECOMP_LIKELY(e)){uint32_t v;memcpy(&v,RECOMP_FM_PTR(e,a),4);return (uint64_t)v;}
+  return recomp_load32_slow(c,a);}
+uint64_t recomp_load64(GuestContext* c,uint64_t a){
+  uintptr_t e=recomp_fm_entry(c,a,8);
+  if(RECOMP_LIKELY(e)){uint64_t v;memcpy(&v,RECOMP_FM_PTR(e,a),8);return v;}
+  return recomp_load64_slow(c,a);}
+void recomp_store8 (GuestContext* c,uint64_t a,uint64_t v){
+  uintptr_t e=recomp_fm_entry(c,a,1);
+  if(RECOMP_LIKELY(e)){*RECOMP_FM_PTR(e,a)=(unsigned char)v;return;}
+  recomp_store8_slow(c,a,v);}
+void recomp_store16(GuestContext* c,uint64_t a,uint64_t v){
+  uintptr_t e=recomp_fm_entry(c,a,2);
+  if(RECOMP_LIKELY(e)){uint16_t t=(uint16_t)v;memcpy(RECOMP_FM_PTR(e,a),&t,2);return;}
+  recomp_store16_slow(c,a,v);}
+void recomp_store32(GuestContext* c,uint64_t a,uint64_t v){
+  uintptr_t e=recomp_fm_entry(c,a,4);
+  if(RECOMP_LIKELY(e)){uint32_t t=(uint32_t)v;memcpy(RECOMP_FM_PTR(e,a),&t,4);return;}
+  recomp_store32_slow(c,a,v);}
+void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){
+  uintptr_t e=recomp_fm_entry(c,a,8);
+  if(RECOMP_LIKELY(e)){memcpy(RECOMP_FM_PTR(e,a),&v,8);return;}
+  recomp_store64_slow(c,a,v);}
+void recomp_ldp64(GuestContext* c,uint64_t a,uint64_t* lo,uint64_t* hi){
+  uintptr_t e=recomp_fm_entry(c,a,16);
+  if(RECOMP_LIKELY(e)){const unsigned char* p=RECOMP_FM_PTR(e,a);
+    memcpy(lo,p,8); memcpy(hi,p+8,8); return;}
+  recomp_ldp64_slow(c,a,lo,hi);}
+void recomp_stp64(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){
+  uintptr_t e=recomp_fm_entry(c,a,16);
+  if(RECOMP_LIKELY(e)){unsigned char* p=RECOMP_FM_PTR(e,a);
+    memcpy(p,&v0,8); memcpy(p+8,&v1,8); return;}
+  recomp_stp64_slow(c,a,v0,v1);}
+void recomp_ldp32(GuestContext* c,uint64_t a,uint64_t* lo,uint64_t* hi){
+  uintptr_t e=recomp_fm_entry(c,a,8);
+  if(RECOMP_LIKELY(e)){const unsigned char* p=RECOMP_FM_PTR(e,a); uint32_t x,y;
+    memcpy(&x,p,4); memcpy(&y,p+4,4); *lo=(uint64_t)x; *hi=(uint64_t)y; return;}
+  recomp_ldp32_slow(c,a,lo,hi);}
+void recomp_stp32(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){
+  uintptr_t e=recomp_fm_entry(c,a,8);
+  if(RECOMP_LIKELY(e)){unsigned char* p=RECOMP_FM_PTR(e,a); uint32_t x=(uint32_t)v0,y=(uint32_t)v1;
+    memcpy(p,&x,4); memcpy(p+4,&y,4); return;}
+  recomp_stp32_slow(c,a,v0,v1);}
+)RT";
+    if (!guard_gen) {
+        return text;
+    }
+    // GG1: stores must not write a watched code page behind the host's back.
+    // The fast path also reads the entry's watch word (same cache line) and
+    // declines when it is set; the store then goes to the host callback, which
+    // writes through Core::Memory and so moves the generation. Stores the fast
+    // path declines for other reasons check the pages they touch the same way
+    // before taking the unchanged ABI 5 walk, which would write directly.
+    // Loads, and the code guard's own reads, are unchanged.
+    const auto replace_once = [&text](const std::string& from, const std::string& to) {
+        const size_t at = text.find(from);
+        text.replace(at, from.size(), to);
+    };
+    replace_once("#define RECOMP_FM_PTR(e,a) ((unsigned char*)((e) + (uintptr_t)(a)))\n",
+                 R"RT(#define RECOMP_FM_PTR(e,a) ((unsigned char*)((e) + (uintptr_t)(a)))
+static RECOMP_INLINE uintptr_t recomp_fm_entry_st(const GuestContext* c, uint64_t va, unsigned bytes){
+  const unsigned char* ent;
+  if(va >= c->fm_limit) return 0;
+  if((va & 0xfffu) > 0x1000u - bytes) return 0;
+  ent = c->fm_table + ((uintptr_t)(va >> RECOMP_FM_PAGE_BITS) << RECOMP_FM_STRIDE_LOG2);
+  if(*(const volatile uint64_t*)(ent + RECOMP_GG_WATCH_OFFSET)) return 0;
+  return *(const uintptr_t*)ent & RECOMP_FM_PTR_MASK;
+}
+/* Whether any page of [va, va + bytes) is watched. Addresses the ABI 5 walk
+   would not serve from the table (outside the space, or wrapping) reach the
+   host callback anyway, so they need no answer here. */
+static RECOMP_NOINLINE int recomp_gg_store_watched(GuestContext* c, uint64_t va, uint64_t bytes){
+  const RecompHostMem* hm = c->host_mem;
+  uint64_t page, last;
+  if(!hm || !hm->page_entries || hm->page_bits >= 64) return 0;
+  va &= 0xffffffffffffULL;
+  if(va >= hm->address_space_max) return 0;
+  last = bytes - 1 > hm->address_space_max - 1 - va ? hm->address_space_max - 1 : va + bytes - 1;
+  for(page = va >> hm->page_bits; page <= last >> hm->page_bits; ++page){
+    if(*(const volatile uint64_t*)((const unsigned char*)hm->page_entries +
+                                   page * hm->page_entry_stride + RECOMP_GG_WATCH_OFFSET)) return 1;
+  }
+  return 0;
+}
+)RT");
+    static constexpr struct {
+        const char* head;
+        const char* slow;
+        const char* watched;
+    } kStores[] = {
+        {"void recomp_store8 (GuestContext* c,uint64_t a,uint64_t v){\n", "  recomp_store8_slow(c,a,v);}",
+         "  if(recomp_gg_store_watched(c,a,1)){memstore(c,a,1,v);return;}\n"},
+        {"void recomp_store16(GuestContext* c,uint64_t a,uint64_t v){\n", "  recomp_store16_slow(c,a,v);}",
+         "  if(recomp_gg_store_watched(c,a,2)){memstore(c,a,2,v);return;}\n"},
+        {"void recomp_store32(GuestContext* c,uint64_t a,uint64_t v){\n", "  recomp_store32_slow(c,a,v);}",
+         "  if(recomp_gg_store_watched(c,a,4)){memstore(c,a,4,v);return;}\n"},
+        {"void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){\n", "  recomp_store64_slow(c,a,v);}",
+         "  if(recomp_gg_store_watched(c,a,8)){memstore(c,a,8,v);return;}\n"},
+        {"void recomp_stp64(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){\n",
+         "  recomp_stp64_slow(c,a,v0,v1);}",
+         "  if(recomp_gg_store_watched(c,a,16)){memstore(c,a,8,v0);memstore(c,a+8,8,v1);return;}\n"},
+        {"void recomp_stp32(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){\n",
+         "  recomp_stp32_slow(c,a,v0,v1);}",
+         "  if(recomp_gg_store_watched(c,a,8)){memstore(c,a,4,v0);memstore(c,a+4,4,v1);return;}\n"},
+    };
+    for (const auto& store : kStores) {
+        const size_t at = text.find(store.head);
+        const size_t e = text.find("recomp_fm_entry(", at);
+        text.replace(e, std::strlen("recomp_fm_entry("), "recomp_fm_entry_st(");
+        const size_t slow = text.find(store.slow, at);
+        text.insert(slow, store.watched);
+    }
+    return text;
+}
+
+// ABI 6 feature GG1: the verification a block runs when its generation moved.
+inline const char* GuardGenC() {
+    return R"RT(/* GG1: the block saw its seen word differ from the generation `gen` it
+   loaded. The acquire fence pairs with the host's release store of `gen`, so
+   the check below reads code and mappings no older than the event that
+   produced it. The check itself is the unchanged per-entry guard, with the
+   same strict rejection or hybrid JIT handoff. Only after it passes does the
+   seen word take `gen`, with release so another core that skips on it cannot get ahead of
+   this check's reads. VERIFY_ALWAYS is never recorded. */
+void recomp_code_guard_gen(GuestContext* c,uint64_t pc,const uint32_t* expected,uint32_t count,
+                           int host_guard_version,uint32_t* seen,uint32_t gen){
+  RECOMP_GG_ACQUIRE_FENCE();
+  recomp_code_guard(c,pc,expected,count,host_guard_version);
+  if(c->halted) return;
+  if(gen!=RECOMP_GG_VERIFY_ALWAYS) RECOMP_GG_STORE_RELEASE(*seen,gen);
+}
+)RT";
+}
+
+inline std::string BuildRuntimeC(bool fastmem, bool guard_gen = false) {
     // MSVC caps one string literal at 16380 bytes (C2026) and this runtime is
-    // past that, so it is assembled from two pieces at first use rather than
-    // being a single literal. Adjacent-literal concatenation would not help:
-    // the limit applies to the result as well.
-    static const std::string text = std::string(R"RT(#include "recomp_runtime.h"
+    // past that, so it is assembled from several pieces at first use rather
+    // than being a single literal. Adjacent-literal concatenation would not
+    // help: the limit applies to the result as well. The memory helpers are a
+    // piece of their own because ABI 6 reuses their exact text as its slow path.
+    const std::string head = std::string(R"RT(#include "recomp_runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6391,6 +7310,7 @@ static void memstore(GuestContext* c, uint64_t a, uint32_t sz, uint64_t v){
 }
 
 static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va);
+static unsigned char* recomp_host_ptr_n(GuestContext* c, uint64_t va, uint64_t bytes);
 
 /* Every generated block checks its compilation input before any guest effect.
    Normal mapped code is compared directly through the host page table. The
@@ -6401,13 +7321,15 @@ static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va);
 
    This runs on entry to every block, so the per-word loop below costs one
    indirect host callback per guest instruction before any guest work happens -
-   the largest single cost in the profile. When the whole block lies inside one
-   mapped page with a real backing pointer, the identical comparison is one
-   memcmp, so take that. It is a faster spelling of the same check, not a weaker
-   one: the same words are compared, and every case the fast path cannot prove
-   safe (unmapped, debug or GPU-tracked memory, a page crossing, an address
-   outside the space, a mismatch) falls through to the loop, which is also what
-   produces the precise diagnostic naming the offending word. */
+   the largest single cost in the profile. Where the block's words lie in mapped
+   pages with real backing pointers, the identical comparison is one memcmp per
+   page, so take that. A block that crosses a page boundary is compared as its
+   in-page pieces; sending it to the loop instead cost one callback per word on
+   every entry. It is a faster spelling of the same check, not a weaker one: the
+   same words are compared, and every case the fast path cannot prove safe
+   (unmapped, debug or GPU-tracked memory, an address outside the space, a
+   mismatch) falls through to the loop, which is also what produces the precise
+   diagnostic naming the offending word. */
 void recomp_code_guard(GuestContext* c,uint64_t pc,const uint32_t* expected,uint32_t count,int host_guard_version){
   uint32_t k;
   if(c->host_mem && host_guard_version!=2){
@@ -6417,10 +7339,16 @@ void recomp_code_guard(GuestContext* c,uint64_t pc,const uint32_t* expected,uint
   }
   if(c->host_mem && c->host_mem->page_entries && c->host_mem->page_bits<63 && count){
     uint64_t page_size=UINT64_C(1)<<c->host_mem->page_bits;
-    uint64_t bytes=(uint64_t)count*4;
-    if(bytes<=page_size && (pc&(page_size-1))<=page_size-bytes){
-      const unsigned char* p=recomp_host_ptr(c,pc);
-      if(p && memcmp(p,expected,(size_t)bytes)==0)return;
+    uint64_t bytes=(uint64_t)count*4, done=0;
+    if(pc<=UINT64_C(0xffffffffffff) && bytes<=UINT64_C(0xffffffffffff)-pc){
+      while(done<bytes){
+        uint64_t va=pc+done, room=page_size-(va&(page_size-1));
+        uint64_t n=bytes-done<room?bytes-done:room;
+        const unsigned char* p=recomp_host_ptr_n(c,va,n);
+        if(!p || memcmp(p,(const unsigned char*)expected+done,(size_t)n)!=0)break;
+        done+=n;
+      }
+      if(done==bytes)return;
     }
   }
   for(k=0;k<count;++k){
@@ -6439,6 +7367,17 @@ void recomp_code_guard(GuestContext* c,uint64_t pc,const uint32_t* expected,uint
       if(valid) memcpy(&actual,c->mem+off,4);
     }
     if(!valid || (uint32_t)actual!=expected[k]){
+#ifdef SUYU_HOSTED_RECOMP
+      /* Hybrid hosts already understand halted=2 as a request to execute the
+         current PC on the JIT. Keep the original entry PC: no instruction of
+         this block has run, including when only a later word changed. */
+      const char* strict=getenv("SUYU_RECOMP_STRICT");
+      if(strict && *strict=='0'){
+        c->halted=RECOMP_HALT_UNHANDLED;
+        c->pending_svc=~UINT64_C(0);
+        return;
+      }
+#endif
       c->pc=va;
       fprintf(stderr,"[recomp] unsupported code change or unavailable code at 0x%llx (expected %08x, read %08x)\n",
               (unsigned long long)va,expected[k],(unsigned)(uint32_t)actual);
@@ -6526,7 +7465,8 @@ uint64_t recomp_cntpct(GuestContext* c){
     return ((now_ns - base_ns) / 1000ULL) * 19200ULL / 1000ULL;
   }
 }
-)RT") + std::string(R"RT(
+)RT");
+    const std::string abi5_helpers = R"RT(
 /* Resolve a guest address to a host pointer the way Memory::GetPointerImpl
    does: mask, bounds check, one page-table entry, extract the backing pointer.
    A null result means unmapped, debug, or GPU-tracked memory, all of which have
@@ -6539,7 +7479,7 @@ uint64_t recomp_cntpct(GuestContext* c){
 static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va){
   const RecompHostMem* hm = c->host_mem;
   uintptr_t raw, p;
-  if(!hm || !hm->page_entries) return 0;
+  if(!hm || !hm->page_entries || hm->page_bits >= 64) return 0;
   va &= 0xffffffffffffULL;                 /* AArch64 ignores the top 16 bits */
   if(va >= hm->address_space_max) return 0;
   raw = *(const uintptr_t*)((const unsigned char*)hm->page_entries
@@ -6558,17 +7498,19 @@ static unsigned char* recomp_host_ptr(GuestContext* c, uint64_t va){
    pattern that finds it. Hand the crossing case to the emulator, which splits
    it correctly.
 
-   An aligned access of a power-of-two size never crosses, because the page size
-   is a larger power of two, so the alignment test alone settles the common case
-   and the page arithmetic is only reached for genuinely unaligned accesses. */
+   Even aligned accesses must respect an address-space limit inside a page.
+   Subtraction-based checks avoid overflowing the end address. */
 static unsigned char* recomp_host_ptr_n(GuestContext* c, uint64_t va, uint64_t bytes){
   const RecompHostMem* hm = c->host_mem;
   uint64_t psz;
-  if((va & (bytes - 1)) != 0){
-    if(!hm || !hm->page_entries || hm->page_bits >= 64) return 0;
-    psz = (uint64_t)1 << hm->page_bits;
-    if(((va & 0xffffffffffffULL) & (psz - 1)) + bytes > psz) return 0;
-  }
+  if(!hm || !hm->page_entries || hm->page_bits >= 64 || !bytes) return 0;
+  va &= 0xffffffffffffULL;
+  /* The fast-path limit can be below a page boundary (diagnostic slow paths).
+     Validate the entire span before reading any entry or backing bytes. */
+  if(va >= hm->address_space_max || bytes > hm->address_space_max - va ||
+     bytes > UINT64_C(0x1000000000000) - va) return 0;
+  psz = UINT64_C(1) << hm->page_bits;
+  if(bytes > psz - (va & (psz - 1))) return 0;
   return recomp_host_ptr(c, va);
 }
 
@@ -6598,9 +7540,12 @@ void recomp_store64(GuestContext* c,uint64_t a,uint64_t v){
    access is skipped. */
 static int recomp_pair_same_page(const RecompHostMem* hm, uint64_t a, uint64_t bytes){
   uint64_t psz;
-  if(!hm || !hm->page_entries) return 0;
-  psz = (uint64_t)1 << hm->page_bits;
-  return (a & (psz - 1)) + bytes <= psz;
+  if(!hm || !hm->page_entries || hm->page_bits >= 64 || !bytes) return 0;
+  a &= 0xffffffffffffULL;
+  if(a >= hm->address_space_max || bytes > hm->address_space_max - a ||
+     bytes > UINT64_C(0x1000000000000) - a) return 0;
+  psz = UINT64_C(1) << hm->page_bits;
+  return bytes <= psz - (a & (psz - 1));
 }
 void recomp_ldp64(GuestContext* c,uint64_t a,uint64_t* lo,uint64_t* hi){
   if(recomp_pair_same_page(c->host_mem,a,16)){
@@ -6632,7 +7577,8 @@ void recomp_stp32(GuestContext* c,uint64_t a,uint64_t v0,uint64_t v1){
   }
   recomp_store32(c,a,v0); recomp_store32(c,a+4,v1);
 }
-
+)RT";
+    const std::string tail = std::string(R"RT(
 #ifndef RECOMP_STATIC_HOST
 /* Owned by the runtime in the single-module shapes (standalone exe, loadable
    shared image). When several modules are linked statically into one host this
@@ -6934,8 +7880,28 @@ void recomp_run(GuestContext* c){
 }
 #endif /* !RECOMP_STATIC_HOST */
 )RT";
-    static const std::string with_estimates = text + EstimateRuntimeC();
-    return with_estimates.c_str();
+    std::string text = head + (fastmem ? FastmemHelpersC(abi5_helpers, guard_gen) : abi5_helpers) + tail +
+                       EstimateRuntimeC();
+    if (fastmem && guard_gen) {
+        static constexpr std::string_view anchor =
+            "void recomp_ic_ivau(GuestContext* c,uint64_t address,int host_guard_version){\n";
+        text.insert(text.find(anchor), GuardGenC());
+    }
+    return text;
+}
+
+inline const char* RuntimeC() {
+    static const std::string abi5 = BuildRuntimeC(false);
+    static const std::string fastmem = BuildRuntimeC(true);
+    static const std::string guard_gen = BuildRuntimeC(true, true);
+    static const std::string abi5_shadow = abi5 + FpxShadowC();
+    static const std::string fastmem_shadow = fastmem + FpxShadowC();
+    static const std::string guard_gen_shadow = guard_gen + FpxShadowC();
+    if (FpxVariant() == 2) {
+        return (EmitGuardGen() ? guard_gen_shadow : g_emit_fastmem ? fastmem_shadow : abi5_shadow)
+            .c_str();
+    }
+    return (EmitGuardGen() ? guard_gen : g_emit_fastmem ? fastmem : abi5).c_str();
 }
 
 } // namespace suyu::recomp

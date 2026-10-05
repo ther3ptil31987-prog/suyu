@@ -9,31 +9,31 @@
 </h1>
 
 <h4 align="center">
-Nintendo Switch emulator and native recompiler — based on <a href="https://git.eden-emu.dev/eden-emu/eden">Eden</a>, which itself descends from yuzu.
+A Nintendo Switch Emulation, Recompilation, Development and Launcher Toolkit — based on <a href="https://git.eden-emu.dev/eden-emu/eden">Eden</a>, which itself descends from yuzu.
 </h4>
 
 <p align="center">
   <a href="#status">Status</a> |
   <a href="#static-recompilation">Static recompilation</a> |
-  <a href="docs/releases/v0.0.10.md">Changes in v0.0.10</a> |
+  <a href="docs/releases/v0.0.11.md">Changes in v0.0.11</a> |
   <a href="#building">Building</a> |
   <a href="#license">License</a>
 </p>
 
 ---
 
-> **This is a continuation of suyu, which was archived upstream at v0.04.**
+> **Development is starting again under new management, help wanted**
 >
 > [`suyu-emu/suyu-v0.0.4`](https://github.com/suyu-emu/suyu-v0.0.4) is a public
-> archive and no further development was planned there. This fork picks it up
-> from commit `d1d09321d7` and continues the numbering: **v0.0.10**.
+> archive and no further development was planned there. This repository picks it up
+> from commit `d1d09321d7` and continues development, now at **v0.0.11**.
 >
 > The name and version line are kept deliberately, so the lineage stays legible.
-> `BUILD_FULLNAME` reads `suyu v0.0.10 (mk8-recomp)` — the suffix says *which*
-> 0.0.10 a binary is, since the archived repository could in principle be picked
+> `BUILD_FULLNAME` reads `suyu v0.0.11 (mk8-recomp)` — the suffix says *which*
+> 0.0.11 a binary is, since the archived repository could in principle be picked
 > up by others too. See [PROVENANCE.md](PROVENANCE.md).
 >
-> Work happens on the `mk8-recomp` branch, driven by
+> Work happens on the `mk8-recomp` branch (soon to be renamed Main), driven by
 > [mk8-recomp](https://github.com/dougchansan/mk8-recomp) — a project statically
 > recompiling Switch titles to native x86-64 using this recompiler. Fixes that
 > are not recompiler-specific are listed below and are useful to anyone running
@@ -43,32 +43,28 @@ Nintendo Switch emulator and native recompiler — based on <a href="https://git
 
 suyu is a Nintendo Switch emulator and AArch64 native recompiler written in C++. It can run decrypted Switch titles using either:
 
-- **HLE/emulation mode** — full hardware-level emulation via the suyu core (GPU, CPU, audio, services)
+- **High Level Emulation mode** — full hardware-level emulation via the suyu core (GPU, CPU, audio, services)
 - **Recompiler mode** — ahead-of-time static recompilation of Switch AArch64 game code to native x86-64 executables, bundled with suyu's HLE backend
 
 Based on [Eden](https://git.eden-emu.dev/eden-emu/eden), with suyu's own improvements to UI, recompiler, and platform support.
 
 ## Status
 
-Current version: **v0.0.10**, continuing from the archived v0.04.
+Current version: **v0.0.11**.
 
-Upstream was inconsistent about its own version — the repository is named
-`suyu-v0.0.4`, the tag reads `v0.04-latest`, and `BUILD_FULLNAME` was hardcoded
-to `v0.04`. This fork normalises to the three-part form. Read literally, `v0.04`
-means 0.4, which was evidently not the intent.
-
-Platforms: Windows and Linux both build and run. macOS (arm64) builds and runs.
-The GUI comes up, and games now boot under Vulkan/MoltenVK with the bundled
-MoltenVK library; see [macOS](#macos).
-Tests are off in that configuration. Android is inherited from upstream and
-untested since the fork; iOS is not included.
+Platforms: Windows and Linux both build and run. macOS (arm64) builds and runs:
+games boot under Vulkan/MoltenVK with the bundled MoltenVK library, and MK8D
+races at 59–60 fps on the JIT; see [macOS](#macos). A RetroArch (libretro) core
+builds for Windows, Linux and macOS. Android: the APK and an opt-in ARM64
+libretro core build, but have run only in a software emulator; real devices are
+untested. iOS is in development. FreeBSD has builds as well.
 
 Linux needs five things Windows does not, all handled by
 [`scripts/build-suyu.sh`][bld] in the consuming project:
 
 - CMake 3.31 (`CMakeModules/CPMUtil.cmake` requires it; Ubuntu 24.04 ships 3.28)
-- `-Dfmt_FORCE_BUNDLED=ON` — the system fmt 9 has no `format_string::get()`, and
-  suyu only forces the bundled one inside a branch that does not apply here
+- fmt 10 or newer — distro fmt 9 lacks `format_string::get()`; older copies
+  now select the pinned bundled release automatically
 - Qt6 Charts, which Ubuntu packages separately
 - system Boost
 - skipping the `externals/ownfoil` submodule, whose own nested submodule no
@@ -80,29 +76,45 @@ resolved only where CPM had fetched boost.
 
 [bld]: https://github.com/dougchansan/mk8-recomp/blob/main/scripts/build-suyu.sh
 
+
+There will be a ROADMAP.MD for suyu's plans as a project soon.
+
 ## Static recompilation
 
-[v0.0.10 downloads](https://github.com/dougchansan/suyu-v0.0.4/releases/tag/v0.0.10) are an experimental static execution checkpoint. **Use Hybrid AOT + JIT for best performance.** Static can load and run more slowly; this is a compatibility milestone, with optimization still in progress.
+**File > Export Game** turns a game into its own package. On Windows, a **Build**
+export is a program with your settings, optional shader cache and automatic
+controller setup, and can be added to Steam directly. Linux and macOS exports are
+Source only. An export contains no game files, keys or firmware: every time it starts
+it reads your own game file and decrypts it with the keys installed in suyu, so it
+does not run without them. Hybrid and static exports (Source included) contain code
+translated from the game, which only runs that way. An export is a local package, not
+an official suyu release; official suyu downloads contain no game material. See the
+[Export Game guide](docs/user/GameExport.md).
 
-| Mode | Purpose |
+Static and Hybrid execution are experimental and tested on MK8D. In its race, a
+v0.0.11 static export runs at about 56 fps on Windows (with Clang installed) and
+about 60 on macOS and Linux, against 60 for the JIT; see the
+[v0.0.11 performance notes](docs/releases/v0.0.11.md#performance).
+
+| Mode (in Export Game order) | Purpose |
 |---|---|
-| suyu static (Experimental) | Ahead-of-time AArch64 code with suyu HLE; use the separate `no-jit` binaries for a host with Dynarmic entirely absent. |
-| Dynarmic JIT (Baseline) | Dynamic compilation for comparison and general compatibility. |
-| Hybrid AOT + JIT | Static code with JIT fallback; recommended for normal play and performance. |
+| suyu Dynarmic JIT (Baseline) | Default. Dynamic compilation; the most compatible. |
+| suyu Hybrid JIT + AOT | Static code with JIT fallback. Performance varies by game; compare it with the Dynarmic JIT export. |
+| suyu static AOT (Experimental) | Ahead-of-time AArch64 code with suyu HLE; for a host with Dynarmic entirely absent, build with `-DSUYU_NO_JIT=ON`. |
 
-The `no-jit` downloads are compiled with `-DSUYU_NO_JIT=ON` and audited for Dynarmic build inputs and executable symbols. Selecting static export mode in an ordinary host is a separate fallback policy; it does not remove the dynamic compiler from that host. No-JIT hosts require compiled coverage and cannot run unsupported AArch32 or runtime-generated code.
+Builds configured with `-DSUYU_NO_JIT=ON` leave Dynarmic out entirely; releases no longer ship separate no-JIT downloads. Selecting static export mode in an ordinary host is a separate fallback policy; it does not remove the dynamic compiler from that host. No-JIT hosts require compiled coverage and cannot run unsupported AArch32 or runtime-generated code.
 
-**Regenerate existing static modules for ABI 4.** Instruction side entries cover aligned addresses inside discovered blocks, and a bounded nonrecursive module loop reduces host dispatch. Automatic title bundles validate manifests, image hashes, ABI and instruction bytes. Hosted library launches use the current bundle rather than stale detached launchers.
+**Re-export old builds (ABI 4 → ABI 5).** ABI 5 validates the generated-image revision, instruction coverage, and memory guards more strictly; ABI 4 bundles are intentionally rejected. Automatic title bundles validate manifests, image hashes, ABI and instruction bytes. Hosted library launches use the current bundle rather than stale detached launchers.
 
-Current local testing reaches controller prompts, menus, attract rendering and the race starting grid without fallback. The starting grid was verified during a bounded idle observation after the replay ended. Race transitions outlast the JIT fixture; matching timing and full-race validation remain open. Tested paths are evidence of compatibility, not a guarantee for all titles or instructions.
+A strict-static MK8D v4.0.0 TAS replay reaches a rendered, controllable race segment with zero JIT fallbacks. Full-race validation remains open. Tested paths are evidence of compatibility, not a guarantee for all titles or instructions.
 
 Recording and playback are armed at boot. Use separate functional fixtures when loading times differ, record screenshots at milestones, and retain a bounded idle observation after EOF. Keep exact EOF and later milestone verdicts separate. Compare performance only with identical work, interleaved arms and an idle machine.
 
-Older speedup numbers used a retired title-screen input fixture and predate the current guarded emitter. They do not describe v0.0.10 gameplay performance. The current slowdown is being profiled; no new speedup is claimed.
+Older speedup numbers used a retired title-screen input fixture and predate the current guarded emitter. They do not describe current gameplay performance; the race figures above do (MK8D v4.0.0, measured 2026-09-22, full table in the release notes).
 
-See [release notes](docs/releases/v0.0.10.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
+See [release notes](docs/releases/v0.0.11.md) and the [campaign and regression safeguards](docs/static-campaign.md). Build/test scripts and synthetic instruction suites are maintained in [mk8-recomp](https://github.com/dougchansan/mk8-recomp).
 
-## Changes in v0.0.5
+## Changes in recent updates
 
 Five of these are defects in suyu itself rather than recompiler work, and affect
 ordinary emulation. Each is one commit.
@@ -188,6 +200,8 @@ Any aggressive DMCA claims or takedown notices against projects that explicitly 
 
 As derived from §512(f), if Nintendo (or an affiliated entity) knowingly materially misrepresents that a project like suyu is infringing (or circumvents TPMs) when it does not, especially if they fail to consider fair use, interoperability exemptions under §1201(f), or the fact that the emulator requires user-provided keys and does not itself contain proprietary Nintendo code, they can be made liable for any Damages against suyu.
 
+See [Legal.MD](https://github.com/suyu-emu/LEGAL.MD).
+
 ## Building
 
 All three platforms below are verified: the Linux instructions were run end to
@@ -245,10 +259,10 @@ cmake -B build -GNinja \
 cmake --build build --target suyu suyu-cmd
 ```
 
-`-Dfmt_FORCE_BUNDLED=ON` is not optional on a distribution shipping fmt 9:
-`logging.h` calls `format_string::get()`, which only exists from fmt 10, and
-suyu forces the bundled copy only inside a branch that does not apply to an
-ordinary Linux build. Without it the build dies several hundred files in.
+The package metadata requires fmt 10 or newer because `logging.h` uses
+`format_string::get()`. A distribution shipping fmt 9 selects the pinned
+bundled release automatically. The explicit flag above also works and keeps
+the dependency choice fixed.
 
 Binaries land in `build/bin`.
 

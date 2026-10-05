@@ -6,7 +6,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 
-#elif defined(__ANDROID__)
+#elif defined(__ANDROID__) && !defined(SUYU_ANDROID_LIBRETRO)
 #include <atomic>
 extern std::atomic<int> g_battery_percentage;
 extern std::atomic<bool> g_is_charging;
@@ -44,6 +44,9 @@ namespace Common {
             info.has_battery = false;
         }
 
+#elif defined(SUYU_ANDROID_LIBRETRO)
+        // RetroArch supplies input/audio, but no host battery API is negotiated.
+        info.has_battery = false;
 #elif defined(__ANDROID__)
         info.percentage = g_battery_percentage.load(std::memory_order_relaxed);
         info.charging = g_is_charging.load(std::memory_order_relaxed);

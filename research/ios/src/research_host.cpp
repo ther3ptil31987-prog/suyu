@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "research_host.h"
 #include "static_registry.h"
+#include <array>
+#include <cstdint>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #ifdef SWITCH_AOT_SYNTHETIC
 extern "C" {
 #include "recomp_runtime.h"
+int switch_aot_enable_guards(void);
 }
 #endif
 
@@ -29,6 +32,7 @@ extern "C" int switch_aot_self_test() {
         return 2;
 #else
         Check(count == 3, "Synthetic module count");
+        Check(switch_aot_enable_guards() != 0, "Generated-image guard negotiation");
         Check(!registry.Lookup(0x100100), "Lookup must reject unsealed registry");
         for (unsigned i = 0; i < count; ++i)
             Check(registry.Bind(i, 0x100000ULL * (i+1)), "Module binding");
@@ -37,7 +41,14 @@ extern "C" int switch_aot_self_test() {
             const auto pc = 0x100000ULL * (i+1) + 0x100;
             auto block = registry.Lookup(pc);
             Check(block != nullptr, "Absolute PC lookup / single base subtraction");
+            // The real emitter guards each entry against the loaded instruction
+            // bytes. Give the synthetic ADD/SVC fixture its actual backing image;
+            // a zero-initialized context is not a loaded guest address space.
+            std::array<std::uint32_t, 2> text{0x91000400U, 0xd4000021U};
             GuestContext context{}; // Full generated type, not just an ABI prefix.
+            context.mem = reinterpret_cast<std::uint8_t*>(text.data());
+            context.mem_size = sizeof(text);
+            context.mem_base_vaddr = pc;
             context.x[0] = 41;
             context.pc = pc;
             context.pending_svc = UINT64_MAX;

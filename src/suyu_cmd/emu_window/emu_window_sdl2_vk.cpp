@@ -66,12 +66,20 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
     // application on macOS, so its window opens behind whatever has focus and the
     // compositor throttles it. Asking for foreground treatment before the window
     // exists is what makes the later raise take effect.
-    SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "0");
+    const bool headless_capture = std::getenv("SUYU_CMD_CAPTURE_HEADLESS") != nullptr;
+    if (!headless_capture) {
+        SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "0");
+    }
+
+    auto window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    if (headless_capture) {
+        window_flags |= SDL_WINDOW_HIDDEN;
+    }
 
     render_window =
         SDL_CreateWindow(window_title.c_str(),
                          Layout::ScreenUndocked::Width, Layout::ScreenUndocked::Height,
-                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                         window_flags);
 
     if (render_window == nullptr) {
         LOG_CRITICAL(Frontend, "Failed to create SDL3 window: {}", SDL_GetError());
@@ -135,12 +143,16 @@ EmuWindow_SDL2_VK::EmuWindow_SDL2_VK(InputCommon::InputSubsystem* input_subsyste
 #endif
     (void)props;
 
-    SDL_ShowWindow(render_window);
-    // Showing a window does not focus it. Without this the window sits behind the
-    // launching terminal, and on macOS a non-frontmost window has its CAMetalLayer
-    // throttled, which looks like an emulator performance problem rather than a
-    // window management one.
-    SDL_RaiseWindow(render_window);
+    // Diagnostic captures can run without entering the user's active desktop.
+    // The Vulkan surface still exists and the renderer supplies frame captures.
+    if (!headless_capture) {
+        SDL_ShowWindow(render_window);
+        // Showing a window does not focus it. Without this the window sits behind the
+        // launching terminal, and on macOS a non-frontmost window has its CAMetalLayer
+        // throttled, which looks like an emulator performance problem rather than a
+        // window management one.
+        SDL_RaiseWindow(render_window);
+    }
     OnResize();
     OnMinimalClientAreaChangeRequest(GetActiveConfig().min_client_area_size);
     SDL_PumpEvents();

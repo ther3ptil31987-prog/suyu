@@ -8,8 +8,10 @@
 #include <memory>
 #include <map>
 #include <string>
+#include <vector>
 
 #include "core/arm/arm_interface.h"
+#include "core/arm/recomp/recomp_guard_gen.h"
 
 namespace Kernel {
 class KProcess;
@@ -54,6 +56,46 @@ void SetRecompLongSlices(bool enabled);
 /// True only after every loaded compiled module negotiated guard version 2.
 void SetRecompCodeGuardReady(bool ready);
 bool IsRecompCodeGuardReady();
+
+/// ABI 6 (FM1): the arguments the loader passes to each module's
+/// recomp_image_fastmem_v1. They describe this host's page table and its view
+/// of the generated context; a module that was compiled against anything else
+/// answers 0 and the bundle is refused.
+struct RecompFastmemLayout {
+    u32 page_bits;
+    u32 stride_log2;
+    u64 pointer_mask;
+    u32 off_table;
+    u32 off_limit;
+};
+RecompFastmemLayout GetRecompFastmemLayout();
+/// True only after every loaded module is ABI 6 and passed the handshake above.
+/// SUYU_RECOMP_FASTMEM=0 still keeps the fast path off at run time.
+void SetRecompFastmemReady(bool ready);
+bool IsRecompFastmemReady();
+
+/// ABI 6 feature GG1 (generation code guard). The loader calls this after
+/// SetRecompLookup, with what each GG1 module's recomp_image_guard_gen_v1
+/// returned, and before the process is created. The guard only engages with
+/// guard-v2 negotiated and without SUYU_RECOMP_GUARD_GEN=0; otherwise every
+/// module verifies on every entry. Returns whether it engaged.
+bool SetRecompGuardGenModules(std::vector<RecompGuardGen::Module> modules);
+
+/// ABI 6 feature FPX1 (exact native FP): the arguments the loader passes to each
+/// FPX1 module's recomp_image_fpx_v1, this host's view of the generated
+/// context's FP fields and of its kill-switch bit.
+struct RecompFpxLayout {
+    u32 off_fpcr;
+    u32 off_fpsr;
+    u64 inhibit_bit;
+};
+RecompFpxLayout GetRecompFpxLayout();
+/// True only after every loaded module reports FPX1 and passed that handshake.
+/// While set, ArmRecomp keeps the host FP mode the fast paths rely on (MXCSR or
+/// FPCR, see core/arm/recomp/guest_fp_env.h) on every guest-core thread;
+/// SUYU_RECOMP_FPX=0 turns the fast paths off through the kill-switch bit.
+void SetRecompFpxReady(bool ready);
+bool IsRecompFpxReady();
 
 /// Called once per loaded module when a process starts, so each recompiled
 /// image can be told where its module actually landed. Addresses baked in by

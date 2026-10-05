@@ -1,16 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//
-// Sub-second attribution for frame stalls.
-//
-// A 1 Hz fps counter says a second went missing; a 3 s `sample` is too coarse
-// to say where. This times the specific places a frame can block - waiting on a
-// pipeline build, acquiring a swapchain image, the present call itself, waiting
-// for a frame's resources - and prints the split for any frame that overran, so
-// a freeze can be attributed instead of guessed at.
-//
-// Off unless SUYU_STALL_PROBE is set, so a normal run pays nothing but an
-// already-predicted branch.
-
 #pragma once
 
 #include <atomic>
@@ -23,82 +11,87 @@
 namespace Vulkan::StallProbe {
 
 inline bool Enabled() {
-    static const bool enabled = std::getenv("SUYU_STALL_PROBE") != nullptr;
+    static const bool enabled = [] {
+        const char* value = std::getenv("SUYU_STALL_PROBE");
+        return value && *value && *value != '0';
+    }();
     return enabled;
 }
 
 inline u64 Now() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count());
+                               std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-inline std::atomic<u64> build_wait_ns{0};
-inline std::atomic<u64> build_wait_count{0};
-inline std::atomic<u64> acquire_ns{0};
-inline std::atomic<u64> present_ns{0};
-inline std::atomic<u64> frame_wait_ns{0};
+inline std::atomic<u64> build_wait_ns{0}, build_wait_count{0};
+inline std::atomic<u64> acquire_ns{0}, present_ns{0}, frame_wait_ns{0};
+inline std::atomic<u64> gpu_idle_ns{0}, draw_ns{0}, draw_count{0}, sched_wait_ns{0};
+inline std::atomic<u64> shader_translate_ns{0}, shader_emit_ns{0}, shader_count{0};
+inline std::atomic<u64> pipeline_build_ns{0}, pipeline_build_count{0};
+inline std::atomic<u64> draw_flush_ns{0}, pipeline_lookup_ns{0}, pipeline_configure_ns{0},
+    draw_record_ns{0};
 
-// Round 2: the first pass showed ~100% of stall time outside every GPU-side
-// wait, so these split what is left. gpu_idle is the GPU thread blocked with an
-// empty command queue - if that owns a stall, the guest never submitted the
-// work and the wall is upstream of video_core entirely.
-inline std::atomic<u64> gpu_idle_ns{0};
-inline std::atomic<u64> draw_ns{0};
-inline std::atomic<u64> draw_count{0};
-inline std::atomic<u64> sched_wait_ns{0};
-
-// Adds the lifetime of the scope to a counter. Counters are summed across
-// threads, so a total can exceed the frame it is reported against - what
-// matters is which bucket is large, not that they add up.
+// The disabled path performs neither clock reads nor atomic counter updates.
+// Counts and durations are published together on scope completion. These are
+// process-wide sums from multiple threads; they can overlap and a scope can
+// straddle a reporting interval. They are NOT additive frame wall-time buckets.
 class Accum {
 public:
-    explicit Accum(std::atomic<u64>& sink_) : sink{sink_}, start{Enabled() ? Now() : 0} {}
+    explicit Accum(std::atomic<u64>& sink, std::atomic<u64>* count = nullptr)
+        : sink_{sink}, count_{count}, enabled_{Enabled()}, start_{enabled_ ? Now() : 0} {}
     ~Accum() {
-        if (start != 0) {
-            sink.fetch_add(Now() - start, std::memory_order_relaxed);
-        }
+        if (!enabled_) return;
+        sink_.fetch_add(Now() - start_, std::memory_order_relaxed);
+        if (count_) count_->fetch_add(1, std::memory_order_relaxed);
     }
     Accum(const Accum&) = delete;
     Accum& operator=(const Accum&) = delete;
-
 private:
-    std::atomic<u64>& sink;
-    u64 start;
+    std::atomic<u64>& sink_;
+    std::atomic<u64>* count_;
+    bool enabled_;
+    u64 start_;
 };
 
-// Called once per present. Reports only frames that overran, so the log holds
-// the freezes rather than 60 lines a second of healthy frames.
 inline void ReportFrame() {
-    if (!Enabled()) {
-        return;
-    }
-    static u64 last_present = 0;
+    if (!Enabled()) return;
+    // Present normally has one caller; TLS also avoids a plain-data race if
+    // separate presentation threads report concurrently.
+    static thread_local u64 last_present = 0;
     const u64 now = Now();
-
     const u64 build = build_wait_ns.exchange(0, std::memory_order_relaxed);
     const u64 builds = build_wait_count.exchange(0, std::memory_order_relaxed);
     const u64 acquire = acquire_ns.exchange(0, std::memory_order_relaxed);
     const u64 present = present_ns.exchange(0, std::memory_order_relaxed);
     const u64 framew = frame_wait_ns.exchange(0, std::memory_order_relaxed);
-    const u64 gpuidle = gpu_idle_ns.exchange(0, std::memory_order_relaxed);
+    const u64 idle = gpu_idle_ns.exchange(0, std::memory_order_relaxed);
     const u64 draw = draw_ns.exchange(0, std::memory_order_relaxed);
     const u64 draws = draw_count.exchange(0, std::memory_order_relaxed);
     const u64 schedw = sched_wait_ns.exchange(0, std::memory_order_relaxed);
-
-    if (last_present != 0) {
-        const u64 frame = now - last_present;
-        if (frame > 100'000'000ULL) { // only frames over 100 ms
-            const double ms = 1.0e-6;
-            const u64 known = build + acquire + present + framew;
-            LOG_INFO(Render_Vulkan,
-                     "STALL frame={:.1f}ms gpu_idle={:.1f}ms draw={:.1f}ms(n={}) "
-                     "sched_wait={:.1f}ms build_wait={:.1f}ms(n={}) acquire={:.1f}ms "
-                     "present={:.1f}ms frame_wait={:.1f}ms unattributed={:.1f}ms",
-                     frame * ms, gpuidle * ms, draw * ms, draws, schedw * ms, build * ms, builds,
-                     acquire * ms, present * ms, framew * ms,
-                     (frame > known ? frame - known : 0) * ms);
-        }
+    const u64 translate = shader_translate_ns.exchange(0, std::memory_order_relaxed);
+    const u64 emit = shader_emit_ns.exchange(0, std::memory_order_relaxed);
+    const u64 shaders = shader_count.exchange(0, std::memory_order_relaxed);
+    const u64 pipeline_build = pipeline_build_ns.exchange(0, std::memory_order_relaxed);
+    const u64 pipeline_builds = pipeline_build_count.exchange(0, std::memory_order_relaxed);
+    const u64 flush = draw_flush_ns.exchange(0, std::memory_order_relaxed);
+    const u64 lookup = pipeline_lookup_ns.exchange(0, std::memory_order_relaxed);
+    const u64 configure = pipeline_configure_ns.exchange(0, std::memory_order_relaxed);
+    const u64 record = draw_record_ns.exchange(0, std::memory_order_relaxed);
+    if (last_present && now - last_present > 100'000'000ULL) {
+        const auto milliseconds = [](u64 ns) { return static_cast<double>(ns) * 1.0e-6; };
+        LOG_INFO(Render_Vulkan,
+                 "STALL present_interval={:.1f}ms completed_scope_totals(overlap_possible): "
+                 "gpu_idle={:.1f}ms draw={:.1f}ms(n={}) sched_wait={:.1f}ms "
+                 "build_wait={:.1f}ms(n={}) shader_translate={:.1f}ms shader_emit={:.1f}ms(n={}) "
+                 "pipeline_build={:.1f}ms(n={}) draw_flush={:.1f}ms lookup={:.1f}ms "
+                 "configure={:.1f}ms record={:.1f}ms acquire={:.1f}ms present={:.1f}ms "
+                 "frame_wait={:.1f}ms",
+                 milliseconds(now - last_present), milliseconds(idle), milliseconds(draw), draws,
+                 milliseconds(schedw), milliseconds(build), builds, milliseconds(translate),
+                 milliseconds(emit), shaders, milliseconds(pipeline_build), pipeline_builds,
+                 milliseconds(flush), milliseconds(lookup), milliseconds(configure),
+                 milliseconds(record), milliseconds(acquire), milliseconds(present),
+                 milliseconds(framew));
     }
     last_present = now;
 }

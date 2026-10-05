@@ -12,6 +12,7 @@ from pathlib import Path
 HEADER = r"""#pragma once
 #include <stdint.h>
 #include <stddef.h>
+#define RECOMP_IMAGE_ABI 5
 typedef struct RecompHostMem {
  void* user;
  uint64_t (*load)(void*,uint64_t,uint32_t);
@@ -24,6 +25,7 @@ typedef struct RecompHostMem {
  uint32_t (*excl_store_pair)(void*,uint64_t,uint32_t,uint64_t,uint64_t);
  const void* page_entries;
  uint64_t page_entry_stride, page_bits, pointer_mask, address_space_max;
+ const uint64_t* guard_generation;
 } RecompHostMem;
 typedef struct GuestContext {
  uint64_t x[32], pc;
@@ -59,10 +61,14 @@ target_compile_definitions(recomp_static_@MODULE@ PRIVATE SUYU_HOSTED_RECOMP=1 R
  g_module_base=g_module_base_@MODULE@ recomp_lookup=recomp_lookup_@MODULE@
  recomp_image_lookup=recomp_image_lookup_@MODULE@
  recomp_image_set_base=recomp_image_set_base_@MODULE@
- recomp_image_entry=recomp_image_entry_@MODULE@)
+ recomp_image_entry=recomp_image_entry_@MODULE@
+ recomp_image_abi=recomp_image_abi_@MODULE@
+ recomp_image_guard_v2=recomp_image_guard_v2_@MODULE@)
 """
 EXPORT = r"""#include "recomp_runtime.h"
 uint64_t g_module_base;
+unsigned recomp_image_abi(void) { return RECOMP_IMAGE_ABI; }
+unsigned recomp_image_guard_v2(unsigned version) { (void)version; return 2; }
 BlockFn recomp_image_lookup(uint64_t pc) { return recomp_lookup(pc-g_module_base); }
 void recomp_image_set_base(uint64_t base) { g_module_base=base; recomp_build_index(); }
 uint64_t recomp_image_entry(void) { return 0x100; }

@@ -13,6 +13,19 @@
     extern int g_recomp_guard_host_v2_##name
 MODULE(smoke);
 MODULE(second);
+#ifdef RECOMP_FEATURE_FASTMEM_PT1
+#define FASTMEM_MODULE(name) \
+    extern unsigned recomp_image_features_##name(void); \
+    extern unsigned recomp_image_fastmem_v1_##name(uint32_t, uint32_t, uint64_t, uint32_t, uint32_t)
+FASTMEM_MODULE(smoke);
+FASTMEM_MODULE(second);
+#endif
+#ifdef RECOMP_FEATURE_GUARD_GEN1
+extern uint32_t* recomp_image_guard_gen_v1_smoke(uint32_t, uint64_t*, uint64_t*, const uint64_t**);
+extern uint32_t* recomp_image_guard_gen_v1_second(uint32_t, uint64_t*, uint64_t*, const uint64_t**);
+extern uint32_t g_recomp_gg_word_smoke, g_recomp_gg_word_second;
+extern uint64_t g_module_base_smoke, g_module_base_second;
+#endif
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
 static void context_at(GuestContext* c, uint64_t base, int budget) {
@@ -29,7 +42,31 @@ int main(void) {
     uint64_t first_lo, first_hi, second_lo, second_hi;
     BlockFn *first_index, *second_index;
     GuestContext first, second;
-    CHECK(recomp_image_abi_smoke() == 4 && recomp_image_abi_second() == 4);
+#ifdef RECOMP_FEATURE_FASTMEM_PT1
+    CHECK(recomp_image_abi_smoke() == 6 && recomp_image_abi_second() == 6);
+    CHECK(recomp_image_features_smoke() & recomp_image_features_second() & RECOMP_FEATURE_FASTMEM_PT1);
+#ifdef RECOMP_FEATURE_GUARD_GEN1
+    /* GG1 renames: each module owns its word, and its FM1 handshake waits for
+       its own GG1 handshake, not the other module's. */
+    {
+        uint64_t lo, end;
+        const uint64_t* base;
+        CHECK(recomp_image_fastmem_v1_smoke(12, 5, ~(uint64_t)3, 872, 880) == 0);
+        CHECK(recomp_image_guard_gen_v1_smoke(2, &lo, &end, &base) == &g_recomp_gg_word_smoke);
+        CHECK(base == &g_module_base_smoke && lo == 0x1000);
+        CHECK(recomp_image_fastmem_v1_second(12, 5, ~(uint64_t)3, 872, 880) == 0);
+        CHECK(recomp_image_guard_gen_v1_second(2, &lo, &end, &base) == &g_recomp_gg_word_second);
+        CHECK(base == &g_module_base_second);
+        CHECK(&g_recomp_gg_word_smoke != &g_recomp_gg_word_second);
+        CHECK(g_recomp_gg_word_second == RECOMP_GG_VERIFY_ALWAYS);
+    }
+#endif
+    CHECK(recomp_image_fastmem_v1_smoke(12, 5, ~(uint64_t)3, 872, 880) == 1);
+    CHECK(recomp_image_fastmem_v1_second(12, 5, ~(uint64_t)3, 872, 880) == 1);
+    CHECK(recomp_image_fastmem_v1_second(12, 5, ~(uint64_t)3, 872, 872) == 0);
+#else
+    CHECK(recomp_image_abi_smoke() == 5 && recomp_image_abi_second() == 5);
+#endif
     CHECK(g_recomp_guard_host_v2_smoke == 0 && g_recomp_guard_host_v2_second == 0);
     CHECK(recomp_image_guard_v2_smoke(2) == 2);
     CHECK(g_recomp_guard_host_v2_smoke == 2 && g_recomp_guard_host_v2_second == 0);

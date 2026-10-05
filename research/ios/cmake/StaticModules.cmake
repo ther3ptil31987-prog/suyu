@@ -31,6 +31,10 @@ function(switch_aot_add_images target exefs)
                 message(FATAL_ERROR "Incomplete generated module: ${module}")
             endif()
         endforeach()
+        file(READ "${exefs}/${module}/recomp_runtime.h" correctness_header)
+        if(NOT correctness_header MATCHES "#define RECOMP_IMAGE_ABI 5")
+            message(FATAL_ERROR "Generated module predates correctness ABI 5; re-export ALL modules")
+        endif()
         file(SHA256 "${exefs}/${module}/recomp_runtime.h" header_hash)
         file(SHA256 "${exefs}/${module}/recomp_runtime.c" runtime_hash)
         set(pair_hash "${header_hash}:${runtime_hash}")
@@ -55,8 +59,10 @@ function(switch_aot_add_images target exefs)
         endif()
         target_link_libraries(${target} PUBLIC recomp_static_${module})
         string(APPEND guard_declarations
+            "extern unsigned recomp_image_abi_${module}(void);\n"
             "extern unsigned recomp_image_guard_v2_${module}(unsigned);\n")
         string(APPEND guard_calls
+            "  if(recomp_image_abi_${module}() != 5) return 0;\n"
             "  if(recomp_image_guard_v2_${module}(2) != 2) return 0;\n")
         # Compile the ACTUAL generated header, not a locally invented prefix.
         set(probe "${CMAKE_CURRENT_BINARY_DIR}/abi_${module}.c")

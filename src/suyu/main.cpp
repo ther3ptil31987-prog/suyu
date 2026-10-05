@@ -148,6 +148,8 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/arm/recomp/arm_recomp.h"
+#include "core/arm/recomp/recomp_gap_session.h"
+#include "core/arm/recomp/recomp_image_features.h"
 #include "core/core_timing.h"
 #include "core/crypto/key_manager.h"
 #include "core/file_sys/card_image.h"
@@ -588,6 +590,16 @@ GMainWindow::GMainWindow(std::unique_ptr<QtConfig> config_, bool has_broken_vulk
         // Start in Gamer mode (enables MCP server)
         if (args[i] == QStringLiteral("-gamer")) {
             QTimer::singleShot(0, this, [this]() { ApplyAppMode(AppMode::Gamer); });
+            continue;
+        }
+        // Open straight into Tools > Install Decryption Keys / Install Firmware, once the
+        // window is up. An exported game missing either starts suyu this way.
+        if (args[i] == QStringLiteral("-install-keys")) {
+            QTimer::singleShot(0, this, [this]() { OnInstallDecryptionKeys(); });
+            continue;
+        }
+        if (args[i] == QStringLiteral("-install-firmware")) {
+            QTimer::singleShot(0, this, [this]() { OnInstallFirmware(); });
             continue;
         }
         // Launch game with a specific user
@@ -1218,6 +1230,10 @@ void GMainWindow::InitializeWidgets() {
     multiplayer_state = new MultiplayerState(this, game_list->GetModel(), ui->action_Leave_Room,
                                              ui->action_Show_Room, *system);
     multiplayer_state->setVisible(false);
+    connect(multiplayer_state, &MultiplayerState::NetworkStateChanged, this,
+            [this] { discord_rpc->Update(); });
+    connect(multiplayer_state, &MultiplayerState::RoomInformationChanged, this,
+            [this] { discord_rpc->Update(); });
 
     // Create status bar
     message_label = new QLabel();
@@ -1246,7 +1262,7 @@ void GMainWindow::InitializeWidgets() {
     cpu_backend_label = new QLabel();
     cpu_backend_label->setToolTip(
         tr("NO JIT identifies a build without a dynamic recompiler. suyu static is experimental "
-           "and can load or run more slowly; use Hybrid AOT + JIT for best performance. "
+           "and can load or run more slowly; performance of each backend varies by game. "
            "When JIT is available, the counter shows transitions from AOT code to Dynarmic. "
            "Zero means no transitions have occurred in this run."));
 
@@ -2045,35 +2061,6 @@ void GMainWindow::AllowOSSleep() {
 
 bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletParameters params,
                           u64 title_id, bool allow_auto_recomp, bool require_auto_recomp) {
-    if (Loader::AppLoader_NRO::IdentifyType(
-            Core::GetGameFileFromPath(vfs, filename.toStdString())) != Loader::FileType::NRO) {
-        if (!CheckFirmwarePresence()) {
-            const auto response = QMessageBox::question(
-                this, tr("Firmware Not Found"),
-                tr("Nintendo Switch firmware was not detected for this launch.\n\n"
-                   "If you already installed firmware, this may be a detection mismatch.\n"
-                   "Choose Continue to attempt launch anyway, or Cancel to stop."),
-                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
-            if (response != QMessageBox::Yes) {
-                return false;
-            }
-        }
-
-        if (!ContentManager::AreKeysPresent()) {
-            const auto response = QMessageBox::warning(
-                this, tr("No Decryption Keys Detected"),
-                tr("No local decryption keys were detected.\n\n"
-                   "Install your keys via\n"
-                   "Tools > Install Decryption Keys,\n"
-                   "or configure an external decryption tool if you prefer.\n\n"
-                   "If your games are already decrypted, choose Continue."),
-                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
-            if (response != QMessageBox::Yes) {
-                return false;
-            }
-        }
-    }
-
     // Shutdown previous session if the emu thread is still active...
     if (emu_thread != nullptr) {
         ShutdownGame();
@@ -2154,6 +2141,12 @@ bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPa
 
     system->SetFilesystem(vfs);
 
+    // Apply the configured version to metadata-free launches, and clear a
+    // previous launch's override when both fields have been reset in Settings.
+    system->SetApplicationVersionOverride(
+        Settings::values.application_version_override.GetValue(),
+        Settings::values.application_display_version_override.GetValue());
+
     if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
         system->GetUserChannel().clear();
     }
@@ -2215,6 +2208,34 @@ bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPa
                 const u16 error_id = static_cast<u16>(result) - loader_id;
                 const std::string error_code = fmt::format("({:04X}-{:04X})", loader_id, error_id);
                 LOG_CRITICAL(Frontend, "Failed to load ROM! {}", error_code);
+
+                // A key the game needs is not installed: say so and offer to install keys,
+                // rather than suggesting the dump is bad.
+                using Loader::ResultStatus;
+                const auto status = static_cast<ResultStatus>(error_id);
+                if (status == ResultStatus::ErrorMissingHeaderKey ||
+                    status == ResultStatus::ErrorMissingProductionKeyFile ||
+                    status == ResultStatus::ErrorMissingTitlekey ||
+                    status == ResultStatus::ErrorMissingTitlekek ||
+                    status == ResultStatus::ErrorMissingKeyAreaKey ||
+                    status == ResultStatus::ErrorMissingSDSeed) {
+                    QMessageBox box(
+                        QMessageBox::Warning, tr("Decryption Keys Missing"),
+                        tr("This game cannot be read because a decryption key is missing (%1).\n\n"
+                           "Install the keys dumped from your own Switch, then start the game "
+                           "again. suyu does not provide, generate or download keys.")
+                            .arg(QString::fromStdString(GetResultStatusString(status))),
+                        QMessageBox::NoButton, this);
+                    QPushButton* install =
+                        box.addButton(tr("Install Decryption Keys..."), QMessageBox::AcceptRole);
+                    box.addButton(QMessageBox::Cancel);
+                    box.setDefaultButton(install);
+                    box.exec();
+                    if (box.clickedButton() == install) {
+                        QTimer::singleShot(0, this, [this] { OnInstallDecryptionKeys(); });
+                    }
+                    break;
+                }
 
                 const auto title =
                     tr("Error while loading ROM! %1", "%1 signifies a numeric error code.")
@@ -2297,6 +2318,45 @@ void GMainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletP
                            StartGameType type, bool require_auto_recomp,
                            InputCommon::TasInput::TasBootMode tas_boot_mode) try {
     LOG_INFO(Frontend, "suyu starting...");
+
+    // Check for keys and firmware before the loader opens the file, so a
+    // missing key is reported to the player before any decryption is attempted.
+    if (Loader::AppLoader_NRO::IdentifyType(
+            Core::GetGameFileFromPath(vfs, filename.toStdString())) != Loader::FileType::NRO) {
+        if (!ContentManager::AreKeysPresent()) {
+            QMessageBox box(QMessageBox::Warning, tr("Decryption Keys Missing"),
+                            tr("suyu has no decryption keys installed.\n\n"
+                               "Games need the keys dumped from your own Switch. suyu does not "
+                               "provide, generate or download them.\n\n"
+                               "Install your keys now? Choose Continue only for content that "
+                               "needs no keys, such as homebrew."),
+                            QMessageBox::NoButton, this);
+            QPushButton* install =
+                box.addButton(tr("Install Decryption Keys..."), QMessageBox::AcceptRole);
+            QPushButton* proceed = box.addButton(tr("Continue"), QMessageBox::DestructiveRole);
+            box.addButton(QMessageBox::Cancel);
+            box.setDefaultButton(install);
+            box.exec();
+            if (box.clickedButton() == install) {
+                QTimer::singleShot(0, this, [this] { OnInstallDecryptionKeys(); });
+                return;
+            }
+            if (box.clickedButton() != proceed) {
+                return;
+            }
+        }
+        if (!CheckFirmwarePresence()) {
+            const auto response = QMessageBox::question(
+                this, tr("Firmware Not Found"),
+                tr("Nintendo Switch firmware was not detected for this launch.\n\n"
+                   "If you already installed firmware, this may be a detection mismatch.\n"
+                   "Choose Continue to attempt launch anyway, or Cancel to stop."),
+                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+            if (response != QMessageBox::Yes) {
+                return;
+            }
+        }
+    }
 
     if (params.program_id == 0 ||
         params.program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
@@ -5718,13 +5778,16 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                                         dialog->IsExportInProgressForTesting()},
                                        {QStringLiteral("done"), dialog->HasExportResultForTesting()},
                                        {QStringLiteral("success"), dialog->ExportSucceededForTesting()},
+                                       {QStringLiteral("conflict"), dialog->ExportConflictForTesting()},
                                        {QStringLiteral("progress"), dialog->ExportProgressForTesting()},
                                        {QStringLiteral("status"), dialog->ExportStatusForTesting()},
                                        {QStringLiteral("output_path"),
                                         dialog->ExportOutputForTesting()},
                                        {QStringLiteral("fallback_modules"),
                                         QJsonArray::fromStringList(
-                                            dialog->FallbackModulesForTesting())}};
+                                            dialog->FallbackModulesForTesting())},
+                                       {QStringLiteral("coverage_status"),
+                                        dialog->CoverageStatusForTesting()}};
                 });
 
             mcp_server_->RegisterTool(
@@ -6048,7 +6111,7 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                         // Return the RPC response before the long export begins.
                         // The caller polls get_aot_export_status while OnExport
                         // pumps the nested Qt event loop.
-                        // Combo order: 0 = suyu static, 1 = Hybrid AOT + JIT,
+                        // RecompileBackend values: 0 = suyu static, 1 = Hybrid AOT + JIT,
                         // 2 = Dynarmic JIT. Without this the harness could only
                         // ever drive whichever backend the dialog opened on.
                         const QString backend_name =
@@ -6058,11 +6121,58 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                             : backend_name == QStringLiteral("hybrid")   ? 1
                             : backend_name == QStringLiteral("dynarmic") ? 2
                                                                          : -1;
+                        const int full_scan = params.contains(QStringLiteral("full_scan"))
+                                                  ? (params[QStringLiteral("full_scan")].toBool() ? 1 : 0)
+                                                  : -1;
+                        const auto app_version =
+                            static_cast<quint32>(params[QStringLiteral("app_version")].toInteger());
+                        const QString display_version =
+                            params[QStringLiteral("display_version")].toString();
+                        // Headless runs never answer a prompt: an existing destination
+                        // is a reported conflict unless the caller chooses otherwise.
+                        GameExportDialog::TestExportOptions options;
+                        const QString conflict =
+                            params[QStringLiteral("conflict")].toString().trimmed().toLower();
+                        options.conflict =
+                            conflict == QStringLiteral("keep_both")
+                                ? Common::PackagePolicy::ConflictPolicy::KeepBoth
+                            : conflict == QStringLiteral("replace")
+                                ? Common::PackagePolicy::ConflictPolicy::ReplaceWithBackup
+                                : Common::PackagePolicy::ConflictPolicy::Fail;
+                        const auto tri_state = [&params](const char* key) {
+                            const QString name = QString::fromLatin1(key);
+                            return params.contains(name) ? (params[name].toBool() ? 1 : 0) : -1;
+                        };
+                        options.include_save = tri_state("include_save");
+                        options.include_shader = tri_state("include_shader");
+                        options.include_config = tri_state("include_config");
+                        options.fail_at = params[QStringLiteral("fail_at")].toString().trimmed();
+                        // "reference" (uses the game file) or "portable" (sealed game file in
+                        // the package); anything else leaves the dialog's choice.
+                        const QString package =
+                            params[QStringLiteral("package")].toString().trimmed().toLower();
+                        options.package = package == QStringLiteral("portable")    ? 1
+                                          : package == QStringLiteral("reference") ? 0
+                                                                                   : -1;
+                        dialog->SetTestExportOptions(options);
                         QTimer::singleShot(0, dialog, [dialog, rom_path, output_dir, format_index,
-                                                       backend_index] {
+                                                       backend_index, full_scan, app_version,
+                                                       display_version] {
                             dialog->TriggerExportForTesting(rom_path, output_dir, format_index,
-                                                            backend_index);
+                                                            backend_index, full_scan, app_version,
+                                                            display_version);
                         });
+                    } else if (action == QStringLiteral("aot_select_rom")) {
+                        // Test-only: select a ROM in the open GameExportDialog without
+                        // exporting, so its Update and Coverage rows can be read back
+                        // through get_aot_export_status.
+                        auto* dialog = qobject_cast<GameExportDialog*>(QApplication::activeModalWidget());
+                        const QString rom_path = params[QStringLiteral("rom_path")].toString().trimmed();
+                        if (!dialog || rom_path.isEmpty()) {
+                            return QJsonObject{{QStringLiteral("success"), false},
+                                               {QStringLiteral("error"), QStringLiteral("Needs an open GameExportDialog and rom_path")}};
+                        }
+                        dialog->SetRomPath(rom_path);
                     } else if (action == QStringLiteral("nintendo_test_one_click")) {
                         // Test-only: directly invoke the One-Click Sign In
                         // handler on whatever NintendoAccountDialog is
@@ -6268,6 +6378,40 @@ void GMainWindow::ApplyAppMode(AppMode mode) {
                             {QStringLiteral("required"), QJsonArray{QStringLiteral("path")}}},
                 [install_firmware_from_directory](const QJsonObject& params) -> QJsonObject {
                     return install_firmware_from_directory(params[QStringLiteral("path")].toString());
+                });
+
+            mcp_server_->RegisterTool(
+                QStringLiteral("install_content_from_path"),
+                QStringLiteral("Install an NSP (DLC or update) into the NAND the way Install Files does, without dialogs."),
+                QJsonObject{{QStringLiteral("type"), QStringLiteral("object")},
+                            {QStringLiteral("properties"),
+                             QJsonObject{{QStringLiteral("path"),
+                                          QJsonObject{{QStringLiteral("type"), QStringLiteral("string")},
+                                                      {QStringLiteral("description"),
+                                                       QStringLiteral("Absolute path to the .nsp file")}}}}},
+                            {QStringLiteral("required"), QJsonArray{QStringLiteral("path")}}},
+                [this](const QJsonObject& params) -> QJsonObject {
+                    const auto path = params[QStringLiteral("path")].toString().toStdString();
+                    if (!QFileInfo(params[QStringLiteral("path")].toString()).isFile()) {
+                        return QJsonObject{{QStringLiteral("result"), QStringLiteral("not_found")}};
+                    }
+                    const auto result = ContentManager::InstallNSP(
+                        *system, *vfs, path, [](size_t, size_t) { return false; });
+                    const char* name = "failure";
+                    switch (result) {
+                    case ContentManager::InstallResult::Success:
+                        name = "success";
+                        break;
+                    case ContentManager::InstallResult::Overwrite:
+                        name = "overwrite";
+                        break;
+                    case ContentManager::InstallResult::BaseInstallAttempted:
+                        name = "base_install_attempted";
+                        break;
+                    case ContentManager::InstallResult::Failure:
+                        break;
+                    }
+                    return QJsonObject{{QStringLiteral("result"), QString::fromLatin1(name)}};
                 });
 
             mcp_server_->RegisterTool(
@@ -6747,13 +6891,23 @@ void GMainWindow::OnLaunchStaticBuild(const QString& executable) {
     // manifest checks. When the export records its source title, open that
     // title in this host instead; LoadROM will select the current cached bundle
     // before creating the guest process.
+    // Current packages record only a title and file name; the full path of the game
+    // file stays in this suyu's settings, found through the package's export ID. Packages
+    // from before that carried the path in game_source.txt.
+    QString recorded_source = GameExportDialog::RecordedExportSource(build.absolutePath());
     QFile source_reference(build.absolutePath() + QDir::separator() +
                            QStringLiteral("game_source.txt"));
-    if (source_reference.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    if (recorded_source.isEmpty() &&
+        source_reference.open(QIODevice::ReadOnly | QIODevice::Text)) {
         const QString line = QString::fromUtf8(source_reference.readLine()).trimmed();
         const QString prefix = QStringLiteral("Recompiled from: ");
         if (line.startsWith(prefix)) {
-            const QString source_path = QDir::fromNativeSeparators(line.mid(prefix.size()));
+            recorded_source = line.mid(prefix.size());
+        }
+    }
+    {
+        if (!recorded_source.isEmpty()) {
+            const QString source_path = QDir::fromNativeSeparators(recorded_source);
             if (QFileInfo::exists(source_path)) {
                 QString launch_path = source_path;
                 u64 hosted_program_id = 0;
@@ -6920,7 +7074,10 @@ namespace {
     };
 std::vector<QLibrary*> loaded_images;
 std::vector<RecompImage> loaded_records;
-constexpr unsigned CurrentRecompImageAbi = 4;
+constexpr unsigned CurrentRecompImageAbi = 5;
+// ABI 6 is ABI 5 plus the FM1 page-table fast path; exports produce it unless
+// SUYU_AOT_FASTMEM=0. A bundle is one ABI or the other, never mixed.
+constexpr unsigned FastmemRecompImageAbi = 6;
 
 // Off unless asked for: this sits on the dispatch path, which runs tens of
 // millions of times a second.
@@ -7082,6 +7239,12 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
                     reason.toStdString());
         return 0;
     };
+    // Set from bundle.json when there is one, otherwise from the first image;
+    // every image must then report the same ABI.
+    unsigned expected_bundle_abi = 0;
+    // FPX1 is all or nothing across a bundle (-1: no ABI 6 image yet).
+    int bundle_fpx = -1;
+    const auto layout = Core::GetRecompFastmemLayout();
 
     QStringList image_paths;
     if (expected_title_id != 0) {
@@ -7105,11 +7268,14 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
             return refuse_bundle(QStringLiteral("manifest title ID does not match %1")
                                      .arg(expected_title));
         }
-        if (root.value(QStringLiteral("image_abi")).toInt() !=
-            static_cast<int>(CurrentRecompImageAbi)) {
-            return refuse_bundle(QStringLiteral("manifest image ABI is not %1")
-                                     .arg(CurrentRecompImageAbi));
+        const int manifest_abi = root.value(QStringLiteral("image_abi")).toInt();
+        if (manifest_abi != static_cast<int>(CurrentRecompImageAbi) &&
+            manifest_abi != static_cast<int>(FastmemRecompImageAbi)) {
+            return refuse_bundle(QStringLiteral("manifest image ABI is not %1 or %2")
+                                     .arg(CurrentRecompImageAbi)
+                                     .arg(FastmemRecompImageAbi));
         }
+        expected_bundle_abi = static_cast<unsigned>(manifest_abi);
         const QJsonArray images = root.value(QStringLiteral("images")).toArray();
         if (images.isEmpty()) {
             return refuse_bundle(QStringLiteral("manifest contains no images"));
@@ -7213,6 +7379,8 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
 
     std::vector<QLibrary*> found;
     std::vector<RecompImage> records;
+    // ABI 6 GG1 handshakes, handed over once the bundle is accepted.
+    std::vector<Core::RecompGuardGen::Module> guard_gen_modules;
     const auto discard_found = [&] {
         for (auto* prior : found) {
             prior->unload();
@@ -7220,6 +7388,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
         }
         found.clear();
         records.clear();
+        guard_gen_modules.clear();
     };
     for (const QString& image_path : image_paths) {
         auto* lib = new QLibrary(image_path, this);
@@ -7249,16 +7418,75 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
         const unsigned abi = image_abi ? image_abi() : 0;
         auto* guard_v2 = reinterpret_cast<unsigned (*)(unsigned)>(
             lib->resolve("recomp_image_guard_v2"));
-        if (require_current_abi &&
-            (abi != CurrentRecompImageAbi || !guard_v2)) {
+        bool abi_ok = (abi == CurrentRecompImageAbi || abi == FastmemRecompImageAbi) && guard_v2 &&
+                      (expected_bundle_abi == 0 || abi == expected_bundle_abi);
+        if (abi_ok && abi == FastmemRecompImageAbi) {
+            // FM1 folds the host page table layout and the context offsets into
+            // the module; it has to agree with this host's.
+            auto* features =
+                reinterpret_cast<unsigned (*)()>(lib->resolve("recomp_image_features"));
+            auto* fastmem_v1 = reinterpret_cast<unsigned (*)(u32, u32, u64, u32, u32)>(
+                lib->resolve("recomp_image_fastmem_v1"));
+            // A feature bit is a requirement on the host: refuse any this host
+            // does not implement, before trusting any other handshake.
+            if (const u32 unknown =
+                    features ? Core::RecompImageFeature::Unsupported(features()) : 0) {
+                LOG_WARNING(Frontend,
+                            "Refusing automatic AOT bundle {}: {} requires image features {:#x} "
+                            "that this host does not implement",
+                            dir.toStdString(), lib->fileName().toStdString(), unknown);
+                lib->unload();
+                lib->deleteLater();
+                discard_found();
+                return 0;
+            }
+            // GG1 images complete the FM1 handshake only after this one.
+            if (features && (features() & Core::RecompImageFeature::GuardGen1)) {
+                using GuardGenFn = u32* (*)(u32, u64*, u64*, const u64**);
+                auto* guard_gen_v1 =
+                    reinterpret_cast<GuardGenFn>(lib->resolve("recomp_image_guard_gen_v1"));
+                Core::RecompGuardGen::Module gg{};
+                gg.word = guard_gen_v1 ? guard_gen_v1(Core::RecompGuardGen::kHostVersion,
+                                                      &gg.code_lo, &gg.code_end, &gg.base)
+                                       : nullptr;
+                if (gg.word) {
+                    guard_gen_modules.push_back(gg);
+                } else {
+                    abi_ok = false;
+                }
+            }
+            abi_ok = abi_ok && features && (features() & 1u) && fastmem_v1 &&
+                     fastmem_v1(layout.page_bits, layout.stride_log2, layout.pointer_mask,
+                                layout.off_table, layout.off_limit) == 1;
+            // FPX1 folds the FP context fields and the kill-switch bit in.
+            const bool has_fpx =
+                abi_ok && (features() & Core::RecompImageFeature::ExactFpX1) != 0;
+            if (has_fpx) {
+                auto* fpx_v1 = reinterpret_cast<unsigned (*)(u32, u32, u64)>(
+                    lib->resolve("recomp_image_fpx_v1"));
+                const auto fpx_layout = Core::GetRecompFpxLayout();
+                abi_ok = fpx_v1 && fpx_v1(fpx_layout.off_fpcr, fpx_layout.off_fpsr,
+                                          fpx_layout.inhibit_bit) != 0;
+            }
+            if (abi_ok && bundle_fpx >= 0 && bundle_fpx != (has_fpx ? 1 : 0)) {
+                abi_ok = false;
+            }
+            if (abi_ok) {
+                bundle_fpx = has_fpx ? 1 : 0;
+            }
+        }
+        if (!abi_ok) {
             LOG_WARNING(Frontend,
-                        "Refusing automatic AOT bundle {}: {} does not provide image ABI {}",
-                        dir.toStdString(), lib->fileName().toStdString(), CurrentRecompImageAbi);
+                        "Refusing automatic AOT bundle {}: {} provides image ABI {}, not a "
+                        "negotiated ABI {} or {} matching the rest of the bundle",
+                        dir.toStdString(), lib->fileName().toStdString(), abi,
+                        CurrentRecompImageAbi, FastmemRecompImageAbi);
             lib->unload();
             lib->deleteLater();
             discard_found();
             return 0;
         }
+        expected_bundle_abi = abi;
         found.push_back(lib);
 
         // The module this image was built from is the directory holding it,
@@ -7358,6 +7586,8 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
             record = match(kByLoadOrder[index]);
         }
         if (record && record->set_base) {
+            // Misses in this module are gaps a re-export can close.
+            Core::RecompGaps::NoteImage(base, record->name);
             if (record->base == base) {
                 return;
             }
@@ -7490,6 +7720,16 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
     Core::SetRecompCodeGuardReady(guard_ready);
     LOG_INFO(Frontend, "Recompiled instruction guard-v2: {}",
              guard_ready ? "ready" : "not negotiated");
+    // Every image was checked against expected_bundle_abi, and ABI 6 ones
+    // passed the fastmem handshake, before being accepted above.
+    Core::SetRecompFastmemReady(expected_bundle_abi == FastmemRecompImageAbi);
+    LOG_INFO(Frontend, "Recompiled image ABI {}; page-table fastmem: {}", expected_bundle_abi,
+             expected_bundle_abi == FastmemRecompImageAbi ? "negotiated" : "not used");
+    // After SetRecompLookup, which forgets any earlier modules. Logs its outcome.
+    Core::SetRecompGuardGenModules(std::move(guard_gen_modules));
+    Core::SetRecompFpxReady(bundle_fpx == 1);
+    LOG_INFO(Frontend, "Recompiled FPX1 native FP: {}",
+             bundle_fpx == 1 ? "negotiated" : "not used");
     LOG_INFO(Frontend, "Loaded {} recompiled module image(s) from {}", loaded_images.size(),
              dir.toStdString());
     return static_cast<int>(loaded_images.size());
@@ -7653,23 +7893,34 @@ void GMainWindow::OnSteamIntegration() {
     SteamIntegration steam(this);
     const bool installed = steam.IsSteamInstalled();
 
-    // Seamless/automated: add suyu itself (icon + overlay-enabled shortcut)
-    // the first time this is opened, so the whole library shows up in Steam
-    // without the user needing to add every game one-by-one. AddGameShortcut
-    // already no-ops if a "suyu" shortcut is already present.
-    bool self_added_this_run = false;
-    if (installed) {
-        self_added_this_run = steam.AddSuyuSelfShortcut();
+    const auto existing_shortcuts = steam.ListShortcuts();
+    const auto self_shortcut = std::find_if(existing_shortcuts.begin(), existing_shortcuts.end(),
+                                            [](const auto& shortcut) {
+                                                return shortcut.app_name == QLatin1String("suyu");
+                                            });
+    const bool self_exists = self_shortcut != existing_shortcuts.end();
+    const bool self_current = self_exists &&
+        QFileInfo(QString(self_shortcut->exe).remove(QLatin1Char('"'))) ==
+            QFileInfo(QCoreApplication::applicationFilePath());
+    bool self_changed_this_run = false;
+    if (installed && !self_current &&
+        QMessageBox::question(
+            this, tr("Steam Integration"),
+            self_exists ? tr("Update your suyu Steam shortcut to this executable?")
+                        : tr("Add suyu to your Steam library? This will create a shortcut "
+                             "with the Steam overlay enabled."),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) ==
+            QMessageBox::Yes) {
+        self_changed_this_run = steam.AddSuyuSelfShortcut();
     }
 
     const auto shortcuts = steam.ListShortcuts();
 
     QString message = installed ? tr("Steam is installed.\n") : tr("Steam is not detected.\n");
-    if (self_added_this_run) {
-        message += tr("suyu itself has been added to your Steam library (overlay enabled) - "
-                       "restart Steam to see it.\n");
+    if (self_changed_this_run) {
+        message += tr("suyu's Steam shortcut was added or updated - restart Steam to see it.\n");
     }
-    message += tr("%1 game shortcut(s) currently managed.\n").arg(shortcuts.size());
+    message += tr("%1 shortcut(s) currently managed.\n").arg(shortcuts.size());
     message += tr("Steam is detected by standard install paths, Steam registry settings, or the STEAM_PATH environment variable.\n");
     message += tr("Artwork is fetched from the Steam Store public search endpoint with no API key required.\n");
     message += tr("Add to Steam will still work without custom artwork if a matched store image cannot be found.");
@@ -8170,7 +8421,7 @@ void GMainWindow::UpdateStatusBar() {
         if (!cpu.backend_active) {
             backend_name = tr("DYNARMIC JIT");
         } else if (cpu.strict_mode || !cpu.jit_available) {
-            backend_name = tr("suyu static (Experimental)");
+            backend_name = tr("suyu static AOT (Experimental)");
         } else {
             backend_name = tr("AOT");
         }

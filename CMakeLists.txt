@@ -3,13 +3,16 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(yuzu)
+project(suyu)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/find")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/externals/cmake-modules")
 
-set(CPM_SOURCE_CACHE ${CMAKE_SOURCE_DIR}/.cache/cpm)
+# Keep an explicit -DCPM_SOURCE_CACHE authoritative, including for read-only
+# source checkouts. A normal variable here would hide the caller's cache entry.
+set(CPM_SOURCE_CACHE "${CMAKE_SOURCE_DIR}/.cache/cpm" CACHE PATH
+    "Directory to download CPM dependencies")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES 0)
 
@@ -22,6 +25,10 @@ include(UseCcache)
 include(CMakeDependentOption)
 include(CTest)
 include(CPMUtil)
+option(SUYU_USE_LOCAL_EXTERNALS "Use locally populated dependency trees (custom revisions)" OFF)
+if(SUYU_USE_LOCAL_EXTERNALS)
+    include(LocalDependencies)
+endif()
 
 if (NOT DEFINED ARCHITECTURE)
     message(FATAL_ERROR "Architecture didn't make it out of scope, did you delete DetectArchitecture.cmake?")
@@ -241,9 +248,16 @@ option(SUYU_BUILD_LIBRETRO_CORE "Build suyu as a libretro core (suyu_libretro.dl
 if (SUYU_BUILD_LIBRETRO_CORE)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
+option(SUYU_ANDROID_LIBRETRO "Build Android libretro without standalone app JNI" OFF)
+if (SUYU_ANDROID_LIBRETRO)
+    if (NOT ANDROID OR NOT SUYU_BUILD_LIBRETRO_CORE)
+        message(FATAL_ERROR "SUYU_ANDROID_LIBRETRO requires Android and SUYU_BUILD_LIBRETRO_CORE")
+    endif()
+    add_compile_definitions(SUYU_ANDROID_LIBRETRO)
+endif()
 option(ENABLE_WIFI_SCAN "Enable WiFi scanning" OFF)
 
-cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" OFF "ENABLE_QT" OFF)
+cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" ON "NOT ANDROID" OFF)
 
 option(YUZU_TESTS "Compile tests" "${BUILD_TESTING}")
 
@@ -396,7 +410,11 @@ else()
     set(OPENSSL_CONFIGURE_VERBOSE ON)
 
     if (OpenSSL_ADDED)
-        AddJsonPackage(openssl-cmake)
+        if (SUYU_ANDROID_LIBRETRO)
+            AddJsonPackage(NAME openssl-cmake OPTIONS "OPENSSL_CONFIGURE_OPTIONS no-asm")
+        else()
+            AddJsonPackage(openssl-cmake)
+        endif()
     endif()
 endif()
 
@@ -452,6 +470,10 @@ endif()
 
 # fmt
 AddJsonPackage(fmt)
+# Third-party headers must not inherit first-party warnings-as-errors.
+if(fmt_ADDED AND TARGET fmt)
+    set_property(TARGET fmt PROPERTY SYSTEM TRUE)
+endif()
 
 # lz4
 AddJsonPackage(lz4)
@@ -577,7 +599,9 @@ if (NOT YUZU_STATIC_ROOM)
     find_package(SimpleIni)
     find_package(sirit)
     find_package(gamemode)
-    find_package(frozen)
+    if(ENABLE_QT)
+        find_package(frozen)
+    endif()
 
     if (ARCHITECTURE_riscv64)
         find_package(biscuit)
@@ -789,11 +813,11 @@ if (ENABLE_DEBUG_TOOLS)
     add_subdirectory(tools/maxwell-ir)
 endif()
 
-# Set yuzu project or yuzu-cmd project as default StartUp Project in Visual Studio depending on whether QT is enabled or not
+# Set suyu project or suyu-cmd project as default StartUp Project in Visual Studio depending on whether QT is enabled or not
 if(ENABLE_QT)
-    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT yuzu)
+    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT suyu)
 else()
-    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT yuzu-cmd)
+    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT suyu-cmd)
 endif()
 
 # Installation instructions
