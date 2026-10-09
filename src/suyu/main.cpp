@@ -127,6 +127,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #endif
 
 #include <fmt/format.h>
+#include "common/cpu_cache_affinity.h"
 #include "common/detached_tasks.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
@@ -2166,6 +2167,8 @@ bool GMainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPa
         nullptr,                                             // Net Connect
     });
 
+    // Before Load creates the emulated CPU threads.
+    Common::ApplyLargestCacheAffinity(Settings::values.cache_affinity.GetValue());
     const Core::SystemResultStatus result{
         system->Load(*render_window, filename.toStdString(), params)};
 
@@ -7533,7 +7536,7 @@ int GMainWindow::LoadRecompiledImagesFrom(const QString& dir, bool require_curre
 
     // Kernel module names carry an "nn" prefix that the export directories do
     // not ("nnrtld" against "rtld"), so try both spellings.
-    Core::SetRecompBaseSetter([](size_t index, const char* module, u64 base) {
+    Core::SetRecompBaseSetter([](size_t index, const char* module, const char*, u64 base) {
         // Try the name first - it works for rtld - then fall back to load
         // order. A game's own modules are not named after the files they were
         // exported from: main is named after the game ("cross2_Release.nss"),
